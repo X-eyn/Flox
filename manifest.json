@@ -1,0 +1,61 @@
+{
+  "manifest_version": 3,
+  "name": "Flox — Pop Out Player with Subtitles",
+  "version": "1.6.0",
+  "description": "Pop out any video into a smooth always-on-top window, with the host player's subtitles mirrored live. Works on YouTube, Netflix, and everything else.",
+  "minimum_chrome_version": "116",
+  "permissions": ["storage", "scripting", "activeTab", "tabs"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "options_ui": {
+    "page": "ui/popup.html",
+    "open_in_tab": true
+  },
+  "action": {
+    "default_title": "Pop out video (Alt+P)",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "all_frames": true,
+      "match_about_blank": true,
+      "run_at": "document_start",
+      "js": ["src/content.js"]
+    },
+    {
+      "matches": ["<all_urls>"],
+      "all_frames": true,
+      "run_at": "document_start",
+      "world": "MAIN",
+      "js": ["src/page-hook.js"]
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["src/page-hook.js"],
+      "matches": ["<all_urls>"],
+      "all_frames": true
+    }
+  ],
+  "commands": {
+    "toggle-pip": {
+      "suggested_key": { "default": "Alt+P" },
+      "description": "Pop out / restore the active video"
+    }
+  }
+}

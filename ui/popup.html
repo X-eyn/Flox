@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Flox</title>
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="dot" id="state-dot"></span>
+      <span>Flox</span>
+    </div>
+    <span class="hint" id="status">checking…</span>
+  </header>
+
+  <button id="pop" class="primary">
+    <span id="pop-label">Pop out video</span>
+    <kbd>Alt+P</kbd>
+  </button>
+
+  <section>
+    <h2>Subtitles</h2>
+    <label class="row toggle">
+      <span>Mirror host subtitles</span>
+      <input type="checkbox" data-key="subtitles">
+    </label>
+    <label class="row">
+      <span>Size</span>
+      <input type="range" data-key="subtitleSize" min="2" max="10" step="0.2">
+      <output data-out="subtitleSize"></output>
+    </label>
+    <label class="row">
+      <span>Background</span>
+      <input type="range" data-key="subtitleBg" min="0" max="1" step="0.05">
+      <output data-out="subtitleBg"></output>
+    </label>
+    <label class="row">
+      <span>Position</span>
+      <input type="range" data-key="subtitleBottom" min="0" max="40" step="1">
+      <output data-out="subtitleBottom"></output>
+    </label>
+    <label class="row">
+      <span>Colour</span>
+      <input type="color" data-key="subtitleColor">
+    </label>
+    <label class="row toggle">
+      <span>Drop shadow</span>
+      <input type="checkbox" data-key="subtitleShadow">
+    </label>
+  </section>
+
+  <section>
+    <h2>Window</h2>
+    <label class="row toggle">
+      <span>Transparency</span>
+      <input type="checkbox" data-key="transparencyEnabled">
+    </label>
+    <label class="row">
+      <span>Opacity</span>
+      <input type="range" data-key="opacity" min="0.2" max="1" step="0.02">
+      <output data-out="opacity"></output>
+    </label>
+    <label class="row toggle">
+      <span>Show controls</span>
+      <input type="checkbox" data-key="showControls">
+    </label>
+    <label class="row toggle">
+      <span>Auto-hide controls</span>
+      <input type="checkbox" data-key="hoverControls">
+    </label>
+    <label class="row toggle">
+      <span>Remember size</span>
+      <input type="checkbox" data-key="rememberSize">
+    </label>
+  </section>
+
+  <section>
+    <h2>Behaviour</h2>
+    <label class="row">
+      <span>Capture mode</span>
+      <select data-key="mode">
+        <option value="auto">Move player (recommended)</option>
+        <option value="stream">Mirror stream (page untouched)</option>
+      </select>
+    </label>
+    <label class="row toggle">
+      <span>Bezel-less window (burn-in subs)</span>
+      <input type="checkbox" data-key="cleanWindow">
+    </label>
+    <label class="row toggle">
+      <span>Always use browser PiP</span>
+      <input type="checkbox" data-key="forceNative">
+    </label>
+    <label class="row toggle">
+      <span>Netflix/DRM: browser PiP</span>
+      <input type="checkbox" data-key="drmNative">
+    </label>
+    <label class="row toggle">
+      <span>Pop out when leaving tab</span>
+      <input type="checkbox" data-key="autoPipOnTabHide">
+    </label>
+    <label class="row toggle">
+      <span>Pause on close</span>
+      <input type="checkbox" data-key="pauseOnClose">
+    </label>
+    <button id="reset" class="ghost">Reset to defaults</button>
+  </section>
+
+  <footer id="err"></footer>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

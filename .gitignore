@@ -1,0 +1,8 @@
+# build artifacts
+*.zip
+
+# editor / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
