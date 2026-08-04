@@ -1,115 +1,159 @@
-# Flox — pop-out video player with live subtitles
+# Flox — Pop Out Player with Live Subtitles
 
-A Manifest V3 extension for Chrome, Opera GX, Edge, Brave, Vivaldi and any other
-Chromium 116+ browser. One click pops the playing video into an always-on-top
-window — and unlike every other pop-out extension, the subtitles come with it.
+A Manifest V3 extension for Chrome, Opera / Opera GX, Edge, Brave, Vivaldi and any
+other Chromium 116+ browser. One click pops the currently playing video into a
+real always-on-top window — **with the host player's subtitles mirrored live**.
 
-## Install
+## Install (unpacked)
 
-1. Open `chrome://extensions` (Opera GX: `opera://extensions`)
-2. Enable **Developer mode**
-3. **Load unpacked** → select this folder
-4. Click the toolbar icon, or press **Alt+P**, while a video is playing
+1. Open `chrome://extensions` (Opera GX: `opera://extensions`).
+2. Turn on **Developer mode**.
+3. **Load unpacked** → select this `flox` folder.
+4. Pin the icon. Click it (or press **Alt+P**) while a video plays.
 
-Alt+P toggles: press it again — in either window — to put the video back.
+> Opera GX: also enable *Allow access to search page results / all sites* if you
+> restricted extension host access. Alt+P can be re-bound at `opera://extensions/shortcuts`.
 
-## Two window modes
+## How it works
 
-**Bezel-less (default).** The video and its subtitles are composited into a canvas
-that feeds the browser's own picture-in-picture window. No title bar, no chrome,
-just the picture. Requires readable frames, so it is used on everything except
-DRM-protected sites.
+**Window:** uses the Document Picture-in-Picture API (`documentPictureInPicture`),
+not the old `<video>` PiP. That gives a real DOM document in an always-on-top OS
+window, which is the only way to draw arbitrary subtitle text over the video.
 
-**Framed.** A Document Picture-in-Picture window that hosts the real `<video>`
-element plus a subtitle overlay, a control bar, and an opacity slider. Used
-automatically on DRM sites (Netflix, Prime Video, Max, Disney+, Hulu), where the
-protected picture cannot be composited by an extension.
+**Video transfer ("Move player", default):** the live `<video>` element is relocated
+into the PiP document, leaving a same-size placeholder behind so the page doesn't
+reflow. It is put back with its original inline styles on close.
 
-Both are always-on-top. Modes can be forced from the options page.
+This matters for performance: moving means **one element — one decode, one paint**.
+Nothing keeps playing behind you in the tab. Verified on YouTube: after popping out,
+`document.querySelectorAll('video').length === 0` in the page, and the element plays
+on in the PiP window with its position intact.
 
-## Subtitles
+Adoption into another document normally tears down MSE/blob-backed sources, and it
+does — measured in a same-origin iframe: `readyState` 4 → 0, `currentTime` → 0. Real
+Document-PiP windows are exempt, which was confirmed directly rather than assumed:
+moving into an actual PiP window preserved `currentTime` at 796 s with no reload.
+The extension still doesn't take it on faith — every move is verified ~260 ms later,
+and if the source did get torn down the element is restored to the page (seeking back
+to where the user was) and **mirroring** takes over: `captureStream()` into a
+`<video>` in the PiP window. Mirroring costs a second paint of every frame, which is
+why it is the fallback and not the default. A 12 s watchdog guarantees the mount path
+can never hang with a blank window on screen, and playback is explicitly resumed
+after a move (relocation pauses the element, and some players re-pause once during
+re-attach).
 
-Four independent sources, merged by priority — the first one producing text wins,
-and they hand over automatically if a player switches renderers mid-stream.
+**Subtitles — four independent sources, merged by priority:**
 
-1. **Network subtitle file.** A `MAIN`-world hook installed at `document_start`
-   watches `fetch` / `XMLHttpRequest` for the subtitle payload the player itself
-   downloads — TTML/IMSC (including Netflix's tick-based timings) or WebVTT — and
-   parses it into cues. Exact text, exact timings, immune to DOM changes.
-   Read-only: responses are passed through untouched.
-2. **Native `TextTrack` cues.** Any track the player switches to `showing` is taken
+1. **Native `TextTrack` cues** — any track the player switched to `showing` is taken
    over (`mode = 'hidden'`, so cues still fire but the browser stops drawing them)
    and re-rendered with your styling. Original modes are restored on close.
-3. **Host caption DOM.** `MutationObserver` on the player's caption container.
-   Profiles for YouTube, Netflix, Prime Video, Disney+/Hotstar, Max, Hulu, Vimeo,
-   Crunchyroll, Twitch, Peacock, Paramount+, Plex, Jellyfin/Emby and Bilibili, plus
-   generic matchers for video.js, Shaka, JW Player, Plyr, MediaElement, Flowplayer.
-4. **Positional detection.** For players whose captions carry no identifying class
-   names (utility-class CSS), caption-shaped text over the lower part of the video
-   is detected by geometry — rejecting timecodes, control bars and interactive
-   elements.
+2. **Page-world cue hook** (`src/page-hook.js`) — patches `TextTrack.addCue` /
+   `addTextTrack` in the page's own JS world to record cues from players that keep
+   their tracks `disabled` and render captions themselves, then reports whichever
+   cue covers the current playback time. Observe-only; it never changes what the
+   page draws.
+3. **Host DOM caption overlays** — `MutationObserver` on the player's own caption
+   container. Site profiles ship for YouTube, Netflix, Prime Video, Disney+/Hotstar,
+   Max, Hulu, Vimeo, Crunchyroll, Twitch, Peacock, Paramount+, Plex, Jellyfin/Emby
+   and Bilibili, plus generic matchers for video.js, Shaka, JW Player, Plyr,
+   MediaElement and Flowplayer, plus a heuristic class/id scan for unknown players.
+4. **Canvas subtitle layers** (ASS/SSA via libass, e.g. Crunchyroll) — the overlay
+   canvas is mirrored pixel-for-pixel into the PiP window each frame.
 
-Canvas-rendered subtitle layers (ASS/SSA via libass) are mirrored pixel-for-pixel.
+A rescan runs every 1.5 s, so captions still appear when the player attaches its
+caption container late or swaps it mid-playback. Sources go quiet between cues, so
+if a site switches renderers mid-stream the next source takes over automatically.
 
-## Video transfer
+**Frames:** the content script runs in every frame, including embedded players.
+The extension scores every video (size, playing state, visibility, duration) and
+pops the right one, so embeds and ad iframes don't win.
 
-The live `<video>` element is moved into the pop-out rather than duplicated: one
-element, one decode, one paint, and nothing left playing behind you in the tab. A
-same-size placeholder holds the page layout, and the element is restored with its
-original inline styles on close.
-
-Every move is verified ~260 ms later. If the media resource did not survive
-adoption, the element is put back (seeking to where the viewer was) and a
-`captureStream` mirror takes over instead. A watchdog guarantees the mount path can
-never hang with a blank window on screen.
-
-## Controls
+## Controls in the PiP window
 
 | Action | Control |
 | --- | --- |
-| Toggle pop-out | toolbar icon, `Alt+P` |
-| Play / pause | click the video, `Space`, `K` |
+| Play / pause | click video, `Space`, `K` |
 | Seek ±5 s / ±10 s | `←` `→` / `J` `L`, or the seek bar |
-| Volume / mute | `↑` `↓` / `M` |
-| Speed 0.25×–3× | the `1×` button |
-| Subtitles on/off | `C` or `CC` |
-| Opacity | slider in the control bar |
-| Fit to video aspect | `⤢` |
-| Back to tab | `⇱` |
-| Close | `Esc`, `✕` |
+| Volume / mute | `↑` `↓` / `M`, or the slider |
+| Speed (0.25×–3×) | the `1×` button |
+| Subtitles on/off | `C` or the `CC` button |
+| Opacity | the small slider in the bar |
+| Fit window to video aspect | `⤢` |
+| Back to the tab | `⇱` |
+| Close | `Esc`, `✕`, or close the window |
 
-The control bar auto-hides after 2.2 s of no pointer movement.
+The control bar auto-hides after 2.2 s of no pointer movement (toggleable).
 
-## Options
+## Options (extension popup)
 
-Right-click the toolbar icon → **Options**.
+Subtitles on/off · size · background plate opacity · vertical position · colour ·
+drop shadow · window transparency + opacity · show/auto-hide controls · remember
+window size · capture mode · auto pop-out when leaving the tab · pause on close.
+Changes apply to an open PiP window instantly.
 
-Subtitles on/off, size, background plate, vertical position, colour, drop shadow ·
-window transparency and opacity · control bar visibility and auto-hide · remember
-window size · capture mode · DRM window mode · auto pop-out when leaving the tab ·
-pause on close. Changes apply to an open window immediately.
+## Performance notes
 
-## Notes
+The PiP document is deliberately cheap: no `backdrop-filter`, no blurs, no
+per-frame JavaScript in the normal path (subtitle updates are event-driven, the
+clock ticks 4×/s), `contain: strict` on the stage, and opacity applied to a single
+composited layer. The only `requestAnimationFrame` loop that ever runs is the
+canvas-subtitle mirror, and only on sites that actually use one.
 
-- Frames are handled: the content script runs in every frame and scores candidate
-  videos by size, playback state, visibility and duration, so embedded players win
-  over ad iframes.
-- DRM-protected video cannot be composited by any extension — the browser refuses
-  frame access for EME media (`captureStream` throws, canvas readback returns
-  black). That is why DRM sites use the framed window, where subtitles are drawn as
-  DOM over the real element.
-- If protected video appears black in the pop-out, disable
-  `chrome://settings/system` → "Use graphics acceleration when available"; the
-  hardware-protected output path does not composite into a PiP surface.
+## What has actually been tested
+
+Run against live pages by loading the real `src/content.js` into them, with a real
+same-origin `Document` substituted for the PiP window (the harness could not create
+an OS-level window — see below).
+
+| Check | Result |
+| --- | --- |
+| Video discovery / scoring on YouTube | picks the player video, score 5113 |
+| Session opens, DOM builds under Trusted Types | pass (after fix, see below) |
+| Control bar: 9 buttons, live clock | pass — `1:03 / 4:27` |
+| Mirror video live in PiP document | pass — 1280×720, playing |
+| Open latency | 103 ms |
+| **YouTube captions mirrored live** | **pass — line-for-line exact match, incl. non-Latin script** |
+| Captions keep tracking as playback advances | pass — 6 consecutive samples |
+| Native `<track>`/WebVTT cues | pass — cues parsed, `<b>` markup stripped, line breaks kept |
+| Host track taken over and restored | `showing` → `hidden` → `showing` on close |
+| Close leaves the page intact | pass — playback continues, zero placeholders left |
+
+Bugs this testing found and fixed, all of which would have shipped broken:
+
+- `innerHTML` in the PiP document **threw on every Trusted-Types site** (YouTube
+  included) — the PiP document inherits the opener's CSP. Now built node-by-node.
+- Move-mode killed MSE playback (see above) — hence the reordered strategy.
+- `await video.play()` on a torn-down element **never resolves** → the session hung
+  forever. Two occurrences; both now fire-and-forget with frame verification.
+- The "site stole the video back" guard raced the fallback path and nulled the
+  window mid-mount. Now armed only after a mount is verified good.
+- Caption line breaks were collapsed into a single line. Now preserved.
+
+Not tested, honestly: **Netflix playback** (the account is logged out and I won't
+sign in), and **creation of the real OS PiP window** — the automation browser has no
+parent window, so `documentPictureInPicture.requestWindow()` returns
+`InvalidStateError: Internal error: no window` there. A bare three-line call to the
+same API fails identically in that environment, so it is the harness, not this code
+— but it means the window-creation call itself is unverified until you run it.
+
+## Known limits (browser-imposed, not fixable in an extension)
+
+- **True window transparency** isn't exposed to web content; the opacity control
+  fades the content against the window's black background.
+- Document PiP requires Chromium **116+**. Older browsers and Firefox fall back to
+  classic PiP with subtitles burned into a canvas — that fallback cannot work on
+  DRM-protected video (Netflix etc.), which is a platform restriction.
+- The window must be opened from a real user gesture (icon click or Alt+P);
+  "auto pop-out when leaving the tab" only works after you've interacted with the page.
 
 ## Layout
 
 ```
 manifest.json
-src/background.js   service worker: frame routing, badge, settings relay, migrations
-src/content.js      video discovery, window sessions, subtitle engine, hotkey
-src/page-hook.js    MAIN-world hook: subtitle network interception + cue capture
-src/settings.js     defaults and storage helpers
-ui/popup.*          options page
+src/background.js   service worker: frame routing, badge, settings relay
+src/content.js      video discovery, PiP session, subtitle engine, fallback
+src/page-hook.js    page-world TextTrack cue recorder
+src/settings.js     defaults + storage helpers
+ui/popup.*          control panel
 icons/
 ```

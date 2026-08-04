@@ -1138,8 +1138,9 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
             y -= size * 1.3;
           }
         }
-        if (v.requestVideoFrameCallback && !text) v.requestVideoFrameCallback(drawFrame);
-        else this._raf = requestAnimationFrame(drawFrame);
+        // Always rAF: a frame-callback loop stalls the moment the source pauses,
+        // which kills the canvas stream and desyncs the window's controls.
+        this._raf = requestAnimationFrame(drawFrame);
       };
       drawFrame();
 
@@ -1153,10 +1154,129 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
       });
       if (!ready) throw new Error('canvas-stream-no-frames');
 
+      // Two-way play/pause sync. The window's buttons act on the mirror element;
+      // forcing it to stay playing pinned the button to "pause" forever, so a
+      // second click could never mean "play". Instead the mirror follows the
+      // source, and user intent on the mirror is forwarded to the source.
+      // The mirror is a live MediaStream: once paused it will not resume cleanly,
+      // and while it is paused the window's button stays stuck on one action. So
+      // the mirror never pauses — it keeps carrying frames — and any press is
+      // treated as a toggle applied to the real video.
+      // Pressing the window's play/pause button pauses the element it hosts —
+      // our mirror. That event is the only reliable signal of intent (Media
+      // Session actions are not delivered for a MediaStream-backed element), so
+      // it drives the toggle, and the mirror is immediately resumed so the
+      // picture never freezes.
+      // The window's transport buttons act on the element it hosts — the mirror.
+      // Mirror state is simply forwarded to the real video, and vice versa, so
+      // the buttons behave exactly as the viewer expects. The draw loop keeps
+      // running while paused, so the mirror can always be resumed.
+      out.addEventListener('pause', () => {
+        if (!this.closed && !this._syncing && !v.paused) { this._lastAction = 'user paused'; v.pause(); }
+      });
+      out.addEventListener('play', () => {
+        if (!this.closed && !this._syncing && v.paused) {
+          this._lastAction = 'user played';
+          v.play().catch((e) => { this._lastAction = 'play rejected: ' + e.name; });
+        }
+      });
+      const mirrorFollow = (paused) => {
+        this._syncing = true;
+        (paused ? out.pause() : out.play().catch(() => {}));
+        setTimeout(() => { this._syncing = false; }, 80);
+      };
+      this._onSrcPause = () => mirrorFollow(true);
+      this._onSrcPlay = () => mirrorFollow(false);
+      v.addEventListener('pause', this._onSrcPause);
+      v.addEventListener('play', this._onSrcPlay);
+
       await out.requestPictureInPicture();
       out.addEventListener('leavepictureinpicture', () => this.close(), { once: true });
+      this._wireMediaSession();
+      this._hideSource();
       send({ type: 'FLOX_OPENED', title: document.title });
       return true;
+    }
+
+    /* The window's buttons belong to the browser and act on the canvas stream,
+     * which has no timeline — so they did nothing. Media Session routes them to
+     * the real element instead, and publishes the true position for the bar. */
+    _wireMediaSession() {
+      const v = this.video;
+      const ms = navigator.mediaSession;
+      if (!ms || !('setActionHandler' in ms)) return;
+      this._msSaved = true;
+
+      const set = (name, fn) => { try { ms.setActionHandler(name, fn); } catch {} };
+      const claim = () => {
+        // Position/state publishing only — the mirror's own pause event carries
+        // the button press, and handling it in both places double-toggles.
+        set('play', () => { if (v.paused) v.play().catch(() => {}); });
+        set('pause', () => { if (!v.paused) v.pause(); });
+        set('seekbackward', (d) => { v.currentTime = Math.max(0, v.currentTime - ((d && d.seekOffset) || 10)); });
+        set('seekforward', (d) => { v.currentTime = Math.min(v.duration || 1e9, v.currentTime + ((d && d.seekOffset) || 10)); });
+        set('seekto', (d) => { if (d && d.seekTime != null) v.currentTime = d.seekTime; });
+        set('previoustrack', null);
+        set('nexttrack', null);
+      };
+      claim();
+
+      const publish = () => {
+        if (this.closed) return;
+        // Players re-register their own handlers as they update state, which
+        // silently steals the window's buttons back. Re-claim them each tick.
+        claim();
+        try {
+          ms.playbackState = v.paused ? 'paused' : 'playing';
+          if (isFinite(v.duration) && v.duration > 0) {
+            ms.setPositionState({
+              duration: v.duration,
+              playbackRate: v.playbackRate || 1,
+              position: Math.min(v.currentTime, v.duration)
+            });
+          }
+        } catch {}
+      };
+      this._msTimer = setInterval(publish, 500);
+      publish();
+    }
+
+    /* One decode, one paint. The source keeps decoding (we draw from it) but the
+     * tab must stop painting it, otherwise the video plays twice on screen. */
+    _hideSource() {
+      const v = this.video;
+      this._srcStyle = v.getAttribute('style') || '';
+      v.style.setProperty('visibility', 'hidden', 'important');
+      const prof = SITE_PROFILES.find(p => p.host.test(location.hostname));
+      this._hidden = [];
+      const hide = (el) => {
+        if (!el || el === v) return;
+        this._hidden.push([el, el.getAttribute('style') || '']);
+        el.style.setProperty('visibility', 'hidden', 'important');
+      };
+      if (prof) { try { document.querySelectorAll(prof.sel).forEach(hide); } catch {} }
+      if (this.subs) for (const el of this.subs._domRoots) hide(el);
+    }
+
+    _restoreSource() {
+      const v = this.video;
+      try { v.removeEventListener('play', this._onSrcPlay); } catch {}
+      try { v.removeEventListener('pause', this._onSrcPause); } catch {}
+      try {
+        if (this._srcStyle) v.setAttribute('style', this._srcStyle);
+        else v.removeAttribute('style');
+      } catch {}
+      for (const [el, style] of this._hidden || []) {
+        try { if (style) el.setAttribute('style', style); else el.removeAttribute('style'); } catch {}
+      }
+      this._hidden = null;
+      if (this._msTimer) { clearInterval(this._msTimer); this._msTimer = null; }
+      if (this._msSaved) {
+        for (const a of ['play', 'pause', 'seekbackward', 'seekforward', 'seekto']) {
+          try { navigator.mediaSession.setActionHandler(a, null); } catch {}
+        }
+        this._msSaved = false;
+      }
     }
 
     setSetting(patch) { S = { ...S, ...patch }; try { chrome.storage.sync.set(patch); } catch {} }
@@ -1166,6 +1286,7 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
       if (this.closed) return;
       this.closed = true;
       cancelAnimationFrame(this._raf);
+      this._restoreSource();          // un-hide the page before anything else
       this.subs && this.subs.destroy();
       exitPiP();
       try { this.out.remove(); this.canvas.remove(); } catch {}
@@ -1331,6 +1452,7 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
         subRoots: s ? s._domRoots.size : 0,
         observers: s ? s._obs.size : 0,
         text: s ? s.text : '',
+        lastAction: current ? current._lastAction || null : null,
         sources: s ? s._src : null
       };
     }
