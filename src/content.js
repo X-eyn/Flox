@@ -11,7 +11,8 @@
     subtitleBottom: 6, subtitleShadow: true, opacity: 1, transparencyEnabled: false,
     showControls: true, hoverControls: true, pauseOnClose: false, returnOnClose: true,
     rememberSize: true, lastSize: { width: 640, height: 360 }, mode: 'auto',
-    autoPipOnTabHide: false, keepAspect: true, drmNative: false, forceNative: false, cleanWindow: true
+    autoPipOnTabHide: false, keepAspect: true, drmNative: false, forceNative: false, cleanWindow: true,
+    debugSubs: false  // subtitle-source readout on the pop-out (diagnostic)
   };
 
   let S = { ...DEFAULTS };
@@ -229,6 +230,12 @@
   // matching site chrome, and observing it costs far more than it can ever pay.
   const MAX_SUB_ROOTS = 8;
 
+  // Used to vet an UNPROVEN candidate root only. A running clock is the classic
+  // impostor: it sits over the video and changes every second, so change
+  // detection alone would trust it.
+  const CLOCK = /^\s*\d+:\d{2}(:\d{2})?\s*(\/|of|-)?\s*(\d+:\d{2}(:\d{2})?)?\s*$/;
+  const isDialogue = (t) => !!t && !CLOCK.test(t) && /\p{L}/u.test(t);
+
   class SubtitleEngine {
     constructor(video) {
       this.video = video;
@@ -247,7 +254,10 @@
       this._obs = new Map();                       // element -> MutationObserver
       this._produced = new Set();                  // roots that have ever yielded text
       this._seen = new Map();                      // root -> { last, changed }
-      this._everHadText = false;                   // any source has ever resolved text
+      this._domProven = false;                     // DOM has produced at least once, ever
+      this._ttOffset = null;                       // measured retiming, seconds; null = uncalibrated
+      this._offSamples = [];                       // recent offset measurements, seconds
+      this._shiftDone = false;                     // track-vs-file comparison already concluded
       this._lastMutated = null;                    // root whose TEXT changed most recently
       this._readQueued = false;
       this.onRoot = () => {};                      // notified as roots are adopted
@@ -310,6 +320,9 @@
      * PiP document where the page-world hook cannot see it.
      */
     _loadTimedText(cues) {
+      // Deliberately NOT gated on _domProven any more: the cue list is what the
+      // offset is measured against, so it must load even when the DOM source is
+      // already working.
       if (!Array.isArray(cues) || !cues.length) return;
       // Sites prefetch subtitle files for other servers, episodes and languages,
       // so the last file to arrive is not necessarily the one playing. Since
@@ -317,6 +330,9 @@
       // replace a working list swaps correct subtitles for wrong ones. Keep a
       // list that is currently producing text.
       if (this._tt && this._src.timedtext) return;
+      // A different file means a different retiming — never carry an offset
+      // measured against the previous one.
+      if (this._tt !== cues) { this._ttOffset = null; this._offSamples = []; this._shiftDone = false; }
       this._tt = cues;
       if (this._ttTimer) return;
       const tick = () => {
@@ -329,9 +345,112 @@
       tick();
     }
 
+    /* ---- offset calibration -------------------------------------------------
+     * The subtitle file has exact text and exact timings; its only defect is a
+     * constant offset, because the viewer retimed it in the player. The player
+     * shows the corrected line, so one matched line is enough to measure that
+     * offset:  offset = currentTime - cue.originalStart.
+     *
+     * After this the file itself is rendered, shifted — complete and clean —
+     * and the DOM is only a calibration probe. That is what stops the mirrored
+     * subtitles inheriting every fade, re-render and dropped line.
+     */
+    _norm(s) {
+      return String(s || '').toLowerCase()
+        .replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+    }
+
+    /* Exact calibration, when the player re-times its own cues.
+     *
+     * Measuring against the DOM is inherently lossy: it needs a caption to be
+     * on screen, it needs that layer to still be readable, and every sample
+     * carries read latency. If the player applies the viewer's delay by
+     * shifting cue times, the selected track already holds the corrected
+     * timings — so comparing it to the file we parsed off the network gives the
+     * offset outright, to the millisecond, from data alone.
+     *
+     * A near-zero result is just as informative: it means this player applies
+     * the delay at render time instead, and the DOM measurement is required.
+     */
+    _detectTrackShift(track) {
+      if (this._shiftDone || !this._tt || !this._tt.length) return;
+      const cues = track.cues;
+      if (!cues || cues.length < 5) return;
+
+      const byText = new Map();
+      for (const c of this._tt) {
+        const k = this._norm(c.t);
+        if (k.length >= 6 && !byText.has(k)) byText.set(k, c.s);
+      }
+      const deltas = [];
+      for (let i = 0; i < cues.length && deltas.length < 60; i++) {
+        const k = this._norm(this._cueText(cues[i]));
+        if (k.length < 6) continue;
+        const s = byText.get(k);
+        if (s == null) continue;
+        deltas.push(cues[i].startTime - s);
+      }
+      if (deltas.length < 5) return;
+
+      deltas.sort((a, b) => a - b);
+      const med = deltas[deltas.length >> 1];
+      const agree = deltas.filter((d) => Math.abs(d - med) < 0.25).length;
+      if (agree < Math.max(4, deltas.length * 0.6)) return;   // not a clean constant shift
+
+      this._shiftDone = true;
+      if (Math.abs(med) > 0.2) { this._ttOffset = med; this._offSamples = [med]; }
+    }
+
+    _measureOffset(domText) {
+      const cues = this._tt;
+      if (!cues || !cues.length || !domText) return;
+      // Prefer the position stamped at the mutation; fall back to now, which is
+      // simply a later — and therefore larger — sample, which the minimum below
+      // discards on its own.
+      const fresh = this._mutAt != null && (performance.now() - this._mutAt) < 400;
+      const now = fresh ? this._mutT : this.video.currentTime;
+      if (!isFinite(now)) return;
+      const key = this._norm(domText);
+      if (key.length < 6) return;              // too short to identify a line
+
+      // Only consider cues within a plausible retiming distance, and prefer the
+      // candidate nearest the offset already believed, so a repeated line does
+      // not yank the estimate around.
+      const WINDOW = 180;
+      let best = null;
+      for (const c of cues) {
+        if (Math.abs(c.s - now) > WINDOW) continue;
+        if (this._norm(c.t) !== key) continue;
+        const off = now - c.s;
+        const ref = this._ttOffset == null ? 0 : this._ttOffset;
+        if (!best || Math.abs(off - ref) < Math.abs(best - ref)) best = off;
+      }
+      if (best == null) return;
+
+      const S = this._offSamples;
+      S.push(best);
+      if (S.length > 16) S.shift();
+      if (S.length < 2) return;
+
+      // Reject a coincidental text match before it can move the estimate.
+      const sorted = [...S].sort((a, b) => a - b);
+      const med = sorted[sorted.length >> 1];
+      const near = sorted.filter((x) => Math.abs(x - med) < 2);
+      if (near.length < 2) return;
+
+      // Measurement error here is one-sided: a caption can be observed at or
+      // AFTER the instant it appeared, never before, so every sample is the
+      // true offset plus some latency. The smallest sample is therefore the
+      // closest to the truth, and more samples only sharpen it. Averaging
+      // instead baked the latency in — which is why a -34s retiming measured
+      // as -32.86s.
+      this._ttOffset = near[0];
+    }
+
     _ttAt(t) {
       const c = this._tt;
       if (!c || !c.length || !isFinite(t)) return '';
+      if (this._ttOffset != null) t -= this._ttOffset;
       let lo = 0, hi = c.length - 1, idx = -1;
       while (lo <= hi) {
         const mid = (lo + hi) >> 1;
@@ -365,25 +484,45 @@
         this._set('cue', '');
       }
 
-      for (const track of tt) {
-        if (this._trackState.has(track)) continue;
+      // At most ONE track is ever bound. Every bound track's cuechange writes to
+      // the same `cue` slot, so binding two loaded tracks — a site keeping more
+      // than one language live — would have them overwrite each other and flip
+      // the text between languages at random.
+      if (this._trackState.size) return;
+
+      const eligible = (track) => {
         // Never consume our own bridge track — the engine feeds it, and taking
         // it over would set it hidden and silence the very output we injected.
-        if (track.__flox || track.label === 'Flox') continue;
-        if (!/subtitles|captions/i.test(track.kind || '')) continue;
-        // Only mirror a track the player actually turned on; take over rendering
-        // (hidden = cues still fire, UA stops drawing them) so styling is ours.
-        if (track.mode !== 'showing') continue;
-        const h = () => {
-          const parts = [];
-          for (const c of track.activeCues || []) parts.push(this._cueText(c));
-          this._set('cue', parts.filter(Boolean).join('\n'));
-        };
-        this._trackState.set(track, { mode: track.mode, h });
-        track.mode = 'hidden';
-        track.addEventListener('cuechange', h);
-        h();
-      }
+        if (track.__flox || track.label === 'Flox') return false;
+        if (!/subtitles|captions/i.test(track.kind || '')) return false;
+        if (track.mode === 'disabled') return false;      // not the selected track
+        // A player that draws its own captions parks the selected track at
+        // `hidden` and reads it itself — cinejoy keeps 311 tracks there. Only
+        // `showing` was adopted before, so on those players this source could
+        // never bind at all. `hidden` is precisely the mode that still fires
+        // cuechange and fills activeCues, so adopt it too; the one that has
+        // actually loaded cues is the selected one.
+        return track.mode === 'showing' || !!(track.cues && track.cues.length);
+      };
+
+      // A `showing` track is the player's own declared choice, so it wins over
+      // any number of merely-loaded ones.
+      const all = [...tt].filter(eligible);
+      const track = all.find(t => t.mode === 'showing') || all[0];
+      if (!track) return;
+
+      const h = () => {
+        const parts = [];
+        for (const c of track.activeCues || []) parts.push(this._cueText(c));
+        this._set('cue', parts.filter(Boolean).join('\n'));
+        this._detectTrackShift(track);
+      };
+      this._trackState.set(track, { mode: track.mode, h });
+      // Only take over rendering if the player was drawing it. A track the
+      // site already parked at `hidden` is left exactly as found.
+      if (track.mode === 'showing') track.mode = 'hidden';
+      track.addEventListener('cuechange', h);
+      h();
     }
 
     _cueText(cue) {
@@ -416,10 +555,13 @@
       // only truly generic tier. What matters is whether anything found by name
       // has ever produced text — not whether anything matched.
       //
-      // But it must also stop once ANY source is working, otherwise every
-      // silence looks like failure and the sweep keeps adopting player chrome
-      // that sits in the caption area.
-      if (!this._produced.size && !this._everHadText) {
+      // Gate on DOM roots specifically, NOT on "any source has produced text".
+      // `timedtext` resolves at page load on sites that ship a subtitle file, so
+      // gating on it meant the sweep never ran, the DOM source was never found,
+      // and playback fell back to the unshifted file. Junk adoption is held off
+      // by _rootText()'s change requirement instead.
+      if (!this._produced.size) {
+        for (const el of this._overlayCandidates(container)) candidates.add(el);
         for (const el of this._positionalCandidates(container)) candidates.add(el);
       }
 
@@ -454,6 +596,12 @@
         const mo = new MutationObserver((recs) => {
           if (recs.some(r => r.type === 'childList' || r.type === 'characterData')) {
             this._lastMutated = el;
+            // Stamp the playback position AT the mutation. Reading it later in
+            // _readDom() measured the offset late by however long the rest of
+            // the pipeline took, and that error is one-sided so it biased every
+            // measurement the same way.
+            try { this._mutT = this.video.currentTime; } catch {}
+            this._mutAt = performance.now();
           }
           this._queueRead();
         });
@@ -463,6 +611,51 @@
       }
       this._scanCanvas(container);
       this._readDom();
+    }
+
+    /* Caption LAYERS, as opposed to caption elements.
+     *
+     * _positionalCandidates() looks for an element that itself sits low in the
+     * frame. Modern players increasingly render into a layer stretched over the
+     * whole video (`position:absolute; inset:0`) and position the text inside
+     * it — cinejoy's subtitle component is exactly this. Such a layer fails the
+     * lower-half test outright, and carries no "caption"/"subtitle" class for
+     * the name tier to match, so neither tier could ever see it.
+     *
+     * The signature used here is structural and player-agnostic: absolutely
+     * positioned, covering most of the video box, few descendants, and holding
+     * no interactive controls. That last filter is what separates a subtitle
+     * layer from a controls overlay — the latter always carries buttons and a
+     * clock, and would otherwise be mistaken for dialogue.
+     *
+     * False positives are cheap: a layer that never changes its text is never
+     * trusted, because _rootText() requires observed change.
+     */
+    _overlayCandidates(container) {
+      const out = [];
+      const v = this.video;
+      const vr = v.getBoundingClientRect();
+      if (!vr.width || !vr.height) return out;
+      const root = container || v.parentElement || document.body;
+      let nodes;
+      try { nodes = root.querySelectorAll('div,section'); } catch { return out; }
+      if (nodes.length > 4000) return out;
+      for (const el of nodes) {
+        if (el === v || el.contains(v)) continue;
+        if (el.getElementsByTagName('*').length > 60) continue;
+        // Controls, not captions.
+        if (el.querySelector('button,input,video,canvas,[role="button"],[role="slider"]')) continue;
+        const cs = getComputedStyle(el);
+        if (cs.position !== 'absolute' && cs.position !== 'fixed') continue;
+        if (cs.visibility === 'hidden' || cs.display === 'none') continue;
+        const r = el.getBoundingClientRect();
+        // Covers most of the video, and is not some page-level container.
+        if (r.width < vr.width * 0.5 || r.height < vr.height * 0.5) continue;
+        if (r.width > vr.width * 1.3 || r.height > vr.height * 1.3) continue;
+        out.push(el);
+        if (out.length >= MAX_SUB_ROOTS) break;
+      }
+      return out;
     }
 
     // Geometry-based caption hunt: only runs when nothing was found by name, and
@@ -521,9 +714,26 @@
       const t = this._extract(el);
       let st = this._seen.get(el);
       if (!st) { this._seen.set(el, { last: t, changed: false }); return ''; }
-      if (t !== st.last) { st.last = t; st.changed = true; }
-      return st.changed ? t : '';
+      const onset = t !== st.last;
+      if (onset) { st.last = t; st.changed = true; }
+      if (!st.changed) return '';
+      // Vetting applies only until a root has proven itself. A clock or a
+      // letterless string is evidence that a candidate is chrome, not dialogue
+      // — but once a root IS the caption layer its text is taken verbatim,
+      // otherwise real subtitles that happen to be music notation, a dash or a
+      // bare number get silently dropped.
+      if (t && !this._produced.has(el) && !isDialogue(t)) return '';
+      // Only an ONSET carries timing information. Re-measuring the same line on
+      // later reads just fed progressively later — and so progressively more
+      // wrong — samples into the estimate.
+      if (t) { this._proveDom(); if (onset) this._measureOffset(t); }
+      return t;
     }
+
+    // The DOM is no longer retired-or-authoritative; it is the calibration
+    // probe. The file keeps polling, but it is only ever TRUSTED once its
+    // offset has been measured against what the player actually rendered.
+    _proveDom() { this._domProven = true; }
 
     _readDom() {
       // Prefer the root whose text just changed. Captions mutate every few
@@ -558,15 +768,23 @@
           if (t) lines.push(t);
         }
       };
-      const segs = el.querySelectorAll('.ytp-caption-segment, .player-timedtext-text-container, span, div');
-      if (segs.length) {
-        const blocks = [...el.children].filter(c => vis(c));
-        if (blocks.length) {
-          for (const b of blocks) push(b.innerText || b.textContent);
+      const read = (soft) => {
+        lines.length = 0;
+        const segs = el.querySelectorAll('.ytp-caption-segment, .player-timedtext-text-container, span, div');
+        if (segs.length) {
+          const blocks = [...el.children].filter(c => vis(c, soft));
+          if (blocks.length) {
+            for (const b of blocks) push(b.innerText || b.textContent);
+          } else push(el.innerText || el.textContent);
         } else push(el.innerText || el.textContent);
-      } else push(el.innerText || el.textContent);
-      const out = lines.join('\n').trim();
-      return out.length > 400 ? '' : out;     // guard against grabbing a whole UI panel
+        const out = lines.join('\n').trim();
+        return out.length > 400 ? '' : out;   // a whole UI panel, not a caption
+      };
+      // Strict first: outgoing lines linger at opacity 0 inside an
+      // overflow-hidden layer, and sweeping them all up blew past the length
+      // cap and returned nothing at all. Soft is the fallback for the moment a
+      // line is mid-fade and strict would see nothing.
+      return read(false) || read(true);
     }
 
     /* ---- source 4: canvas subtitles (ASS/libass, e.g. Crunchyroll) ---- */
@@ -603,9 +821,24 @@
       text = (text || '').replace(/\n{2,}/g, '\n').trim();
       if (this._src[kind] === text) return;
       this._src[kind] = text;
-      const resolved = this._src.dom || this._src.cue || this._src.hook || this._src.timedtext || '';
+      // Once the DOM source is proven working it becomes exclusive, and STAYS
+      // exclusive. This flag is deliberately sticky: it was previously derived
+      // from the live set of producing roots, so when the player replaced its
+      // caption layer the set briefly emptied, `timedtext` took over, and the
+      // viewer saw unshifted lines they had already passed until the new layer
+      // was adopted. Showing nothing during that gap is correct; showing the
+      // wrong subtitles is not.
+      // Calibrated file wins outright: exact text, exact timings, shifted by the
+      // measured offset. It has no gaps to fill and no fade artefacts, so it is
+      // strictly better than the DOM it was calibrated against.
+      // Until calibration lands, the DOM is authoritative if it works, because
+      // the UNSHIFTED file is exactly the wrong-timing problem being solved.
+      const resolved = this._ttOffset != null
+        ? (this._src.timedtext || '')
+        : this._domProven
+          ? this._src.dom
+          : (this._src.dom || this._src.cue || this._src.hook || this._src.timedtext || '');
       if (resolved === this.text) return;
-      if (resolved) this._everHadText = true;
       this.text = resolved;
       this.onText(resolved);
     }
@@ -1291,7 +1524,10 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
           c.width = v.videoWidth; c.height = v.videoHeight;
         }
         try { ctx.drawImage(v, 0, 0, c.width, c.height); } catch {}
-        const text = S.subtitles ? (this.subs.text || '') : '';
+        // The draw loop starts before the subtitle engine does — PiP must be
+        // requested first, while the user activation is still valid — so this
+        // must tolerate `subs` not existing yet.
+        const text = S.subtitles && this.subs ? (this.subs.text || '') : '';
         if (text) {
           const size = Math.round(c.height * (S.subtitleSize / 100) * 1.15);
           ctx.font = `600 ${size}px system-ui, "Segoe UI", sans-serif`;
@@ -1307,6 +1543,36 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
             y -= size * 1.3;
           }
         }
+        // TEMPORARY DIAGNOSTIC. Prints which subtitle source is actually
+        // winning, straight onto the pop-out. Remove once sync is confirmed.
+        if (S.debugSubs && this.subs) {
+          const s = this.subs;
+          const w = (x) => (x ? String(x).replace(/\n/g, ' ⏎ ').slice(0, 34) : '—');
+          const rows = [
+            'src=' + (s._ttOffset != null ? 'FILE+off' : s._domProven ? 'DOM' : 'fallback') +
+              ' off=' + (s._ttOffset != null ? s._ttOffset.toFixed(2) + 's' : '—') +
+              ' n=' + s._offSamples.length +
+              ' cues=' + (s._tt ? s._tt.length : 0) +
+              ' roots=' + s._domRoots.size + ' ok=' + s._produced.size,
+            'dom : ' + w(s._src.dom),
+            'cue : ' + w(s._src.cue),
+            'hook: ' + w(s._src.hook),
+            'file: ' + w(s._src.timedtext)
+          ];
+          const fs = Math.max(11, Math.round(c.height * 0.022));
+          ctx.font = `600 ${fs}px monospace`;
+          ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+          let dy = fs * 0.4;
+          for (const row of rows) {
+            const m = ctx.measureText(row);
+            ctx.fillStyle = 'rgba(0,0,0,.72)';
+            ctx.fillRect(fs * 0.3, dy, m.width + fs * 0.5, fs * 1.2);
+            ctx.fillStyle = '#7dff9b';
+            ctx.fillText(row, fs * 0.55, dy + fs * 0.1);
+            dy += fs * 1.3;
+          }
+        }
+
         // Always rAF: a frame-callback loop stalls the moment the source pauses,
         // which kills the canvas stream and desyncs the window's controls.
         this._raf = requestAnimationFrame(drawFrame);
@@ -1422,10 +1688,18 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
       v.style.setProperty('visibility', 'hidden', 'important');
       const prof = SITE_PROFILES.find(p => p.host.test(location.hostname));
       this._hidden = [];
+      // Caption roots are hidden with opacity, NOT visibility. This is the
+      // whole reason the mirrored subtitles were wrong: `visibility:hidden`
+      // makes an element unreadable to vis(), so _readDom() skipped the very
+      // caption layer it needs, the DOM source never produced, and playback
+      // silently fell back to the raw subtitle file — which carries the file's
+      // own timings and cannot reflect the viewer's delay setting. Opacity
+      // hides it just as completely while leaving it readable.
       const hide = (el) => {
         if (!el || el === v) return;
         this._hidden.push([el, el.getAttribute('style') || '']);
-        el.style.setProperty('visibility', 'hidden', 'important');
+        el.style.setProperty('opacity', '0', 'important');
+        el.style.setProperty('pointer-events', 'none', 'important');
       };
       if (prof) { try { document.querySelectorAll(prof.sel).forEach(hide); } catch {} }
       if (this.subs) {
@@ -1591,7 +1865,9 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
     'capture-unavailable': 'Flox: this video cannot be captured.',
     'video-transfer-failed': 'Flox: this player refused to release its video.',
     'canvas-stream-no-frames': 'Flox: no frames from this player — try again once it is playing.',
-    'native-pip-disabled': 'Flox: picture-in-picture is disabled in your browser settings.'
+    'native-pip-disabled': 'Flox: picture-in-picture is disabled in your browser settings.',
+    'injected-retry': 'Flox: this tab predates the extension — press again.',
+    'restricted-page': 'Flox: extensions cannot run on this page.'
   };
   const explain = (reason) => REASONS[reason] || ('Flox: could not pop out (' + reason + ')');
 

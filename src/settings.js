@@ -23,6 +23,9 @@ export const DEFAULTS = {
                             //            but the tab keeps painting the video too)
   autoPipOnTabHide: false,  // pop out automatically when you leave the tab
   keepAspect: true,
+  debugSubs: false,         // draw the subtitle-source readout over the pop-out.
+                            // Diagnostic only: shows which subtitle source won,
+                            // the measured subtitle offset and the root counts.
   cleanWindow: true,        // bezel-less: browser PiP window fed by a canvas with
                             // the subtitles burned in. No title bar, but costs a
                             // per-frame draw and can't work on DRM sites.

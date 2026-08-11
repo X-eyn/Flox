@@ -99,35 +99,63 @@ async function ensureInjected(tabId) {
   return { ok: true };
 }
 
-export async function togglePiP(tabId, { report = true } = {}) {
-  const res = await runToggle(tabId);
-  if (!res.ok && report) await reportToUser(tabId, res.reason);
-  return res;
+/**
+ * Settings are cached in memory purely so the click path never has to await
+ * storage. `null` is fine to pass — the content script keeps its own copy.
+ */
+let settingsCache = null;
+getSettings().then((s) => { settingsCache = s; }).catch(() => {});
+
+/**
+ * THE RULE FOR THIS FILE: nothing may be awaited between a user gesture and the
+ * chrome.scripting call that acts on it.
+ *
+ * requestPictureInPicture() and documentPictureInPicture.requestWindow() both
+ * require transient user activation in the target frame. The activation that a
+ * toolbar click grants is forwarded through chrome.scripting.executeScript, but
+ * only while the worker still holds it — every awaited call in between spends
+ * it, and the page-side request is then refused with "Must be handling a user
+ * gesture". Probing for the content script, reading storage and re-injecting all
+ * did exactly that. Recovery work happens AFTER the injection, never before.
+ */
+export function togglePiP(tabId, { report = true } = {}) {
+  let results;
+  const done = (res) => {
+    if (!res.ok && report) reportToUser(tabId, res.reason);
+    return res;
+  };
+  // force: true, single pass. The old code ran a probe pass and then a second
+  // "forced" pass at the best frame, but that second call came after an await
+  // and so arrived without the gesture. Frames with no video return no-video
+  // and do nothing, so one forced pass is safe.
+  return chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    func: invokeToggle,
+    args: [true, settingsCache]
+  }).then((r) => {
+    results = r;
+    const acted = results.find(x => x.result && x.result.ok);
+    if (acted) return acted.result;
+    return recover(tabId, results).then(done);
+  }).catch((e) => done({ ok: false, reason: 'inject-failed: ' + e.message }));
 }
 
-async function runToggle(tabId) {
-  const tab = await chrome.tabs.get(tabId).catch(() => null);
-  if (tab && RESTRICTED.test(tab.url || '')) return { ok: false, reason: 'restricted-page' };
-
-  const ready = await ensureInjected(tabId);
-  if (!ready.ok) return ready;
-
-  const settings = await getSettings();
-  let results = [];
-  try {
-    results = await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
-      func: invokeToggle,
-      args: [false, settings]
-    });
-  } catch (e) {
-    return { ok: false, reason: 'inject-failed: ' + e.message };
+/**
+ * Ran after a failed pass, so awaits are free here. Its job is to explain the
+ * failure, and to repair the one case it can: a tab that predates the extension
+ * and therefore has no content script at all.
+ */
+async function recover(tabId, results) {
+  const noScript = results.length && results.every(r => r.result && r.result.reason === 'no-content-script');
+  if (noScript) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (tab && RESTRICTED.test(tab.url || '')) return { ok: false, reason: 'restricted-page' };
+    await ensureInjected(tabId);
+    // Deliberately not retried here: the gesture is gone, so the retry would be
+    // refused anyway. The script is in place now, so the next press works.
+    return { ok: false, reason: 'injected-retry' };
   }
 
-  const acted = results.find(r => r.result && r.result.ok);
-  if (acted) return acted.result;
-
-  // Nobody had a *playing* video. Pick the frame with the best candidate and force it.
   let best = null;
   for (const r of results) {
     const s = r.result && r.result.score || 0;
@@ -142,12 +170,10 @@ async function runToggle(tabId) {
     return { ok: false, reason: pick || reasons[0] || 'no-video' };
   }
 
-  const forced = await chrome.scripting.executeScript({
-    target: { tabId, frameIds: [best.frameId] },
-    func: invokeToggle,
-    args: [true, settings]
-  });
-  return (forced[0] && forced[0].result) || { ok: false, reason: 'forced-failed' };
+  // A frame scored but did not act, so the pass reached it and was refused for
+  // a real reason. Report that, rather than re-injecting without a gesture.
+  const r = results.find(x => x.frameId === best.frameId);
+  return { ok: false, reason: (r && r.result && r.result.reason) || 'forced-failed' };
 }
 
 /**
@@ -171,16 +197,42 @@ function flashBadge(tabId) {
   setTimeout(() => chrome.action.setBadgeText({ tabId, text: '' }).catch(() => {}), 3000);
 }
 
-// Clicking the toolbar icon pops out immediately — no popup, no second click.
-// Settings live on the options page (right-click the icon → Options).
+// Clicking the toolbar icon pops out immediately — no popup, no second click,
+// and never a confirmation. Settings live on the options page.
 chrome.action.onClicked.addListener((tab) => {
   if (tab && tab.id != null) togglePiP(tab.id);
 });
 
-chrome.commands.onCommand.addListener(async (cmd) => {
+/**
+ * Manifest content_scripts only cover future navigations, so tabs that were
+ * already open when the extension was installed or reloaded have no content
+ * script. That used to be repaired at click time, which cost the user gesture.
+ * Do it up front instead, so the click path never has to.
+ */
+async function injectAllTabs() {
+  const tabs = await chrome.tabs.query({ url: ['http://*/*', 'https://*/*'] }).catch(() => []);
+  for (const t of tabs) {
+    if (t.id == null) continue;
+    chrome.scripting.executeScript({
+      target: { tabId: t.id, allFrames: true }, func: probePresence
+    }).then((res) => {
+      if (res.some(r => r.result)) return;
+      return ensureInjected(t.id);
+    }).catch(() => {});
+  }
+}
+
+chrome.runtime.onInstalled.addListener(injectAllTabs);
+chrome.runtime.onStartup.addListener(injectAllTabs);
+injectAllTabs();   // also covers a plain service-worker restart
+
+// Same rule as the click path: no await before the injection. `tab` is supplied
+// with the event, so the query that used to sit here is not needed.
+chrome.commands.onCommand.addListener((cmd, tab) => {
   if (cmd !== 'toggle-pip') return;
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (tab) togglePiP(tab.id);
+  if (tab && tab.id != null) { togglePiP(tab.id); return; }
+  chrome.tabs.query({ active: true, currentWindow: true })
+    .then(([t]) => { if (t) togglePiP(t.id); }).catch(() => {});
 });
 
 // The content script's own Alt+, handler routes here when it can't act locally
