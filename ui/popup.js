@@ -44,7 +44,6 @@ const REASONS = {
   'no-video': 'No video found on this page.',
   'no-content-script': 'Reload the page, then try again.',
   'not-playing': 'Video found but paused — start it, then try again.',
-  'needs-gesture': 'Click the prompt on the page to finish popping out.',
   'restricted-page': 'Extensions cannot run on this page.',
   'drm-move-failed': 'DRM-protected — turn on the browser’s own PiP window below.',
   'native-pip-disabled': 'Picture-in-picture is disabled in your browser settings.'

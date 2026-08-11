@@ -156,8 +156,6 @@ async function runToggle(tabId) {
  * blocked injection) the badge is all we have.
  */
 async function reportToUser(tabId, reason) {
-  // The frame already showed its own clickable prompt for this one.
-  if (reason === 'needs-gesture') return;
   try {
     const res = await chrome.scripting.executeScript({
       target: { tabId, allFrames: true }, func: reportFailure, args: [reason || 'no-video']

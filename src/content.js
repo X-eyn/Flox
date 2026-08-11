@@ -49,21 +49,19 @@
   /* ----------------------------------------------------------------- HUD ---
    * Every failure path used to end in a swallowed result object, so a click
    * that couldn't work looked exactly like a click that did nothing. This is a
-   * shadow-DOM overlay so no host stylesheet can hide or restyle it, and it is
-   * also the click target for the user-activation fallback below.
+   * shadow-DOM overlay so no host stylesheet can hide or restyle it. It only
+   * ever reports; it is never interactive and never gates a pop-out.
    * ------------------------------------------------------------------------ */
   const HUD_CSS = `
 #b{font:600 13px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:#eef2f8;
   background:rgba(14,17,23,.95);border:1px solid rgba(255,255,255,.13);border-radius:10px;
   padding:9px 13px;box-shadow:0 10px 30px rgba(0,0,0,.5);max-width:330px;
   opacity:0;transform:translateY(-6px);transition:opacity .16s ease,transform .16s ease}
-#b.show{opacity:1;transform:none}
-#b.act{cursor:pointer;border-color:#5b8cff;background:rgba(20,28,48,.97)}
-#b.act:hover{background:rgba(28,40,66,.97)}`;
+#b.show{opacity:1;transform:none}`;
 
-  let hudHost = null, hudBox = null, hudT = 0, hudClick = null;
+  let hudHost = null, hudBox = null, hudT = 0;
 
-  function hud(msg, onClick) {
+  function hud(msg) {
     try {
       const root = document.documentElement;
       if (!root || !msg) return;
@@ -77,25 +75,18 @@
         st.textContent = HUD_CSS;
         hudBox = document.createElement('div');
         hudBox.id = 'b';
-        hudBox.addEventListener('click', () => {
-          const fn = hudClick;
-          if (fn) { hudClick = null; hideHud(); fn(); }
-        });
         sr.append(st, hudBox);
         root.appendChild(hudHost);
       }
       hudBox.textContent = msg;
-      hudClick = typeof onClick === 'function' ? onClick : null;
-      hudBox.classList.toggle('act', !!hudClick);
       hudBox.classList.add('show');
       clearTimeout(hudT);
-      hudT = setTimeout(hideHud, hudClick ? 9000 : 2800);
+      hudT = setTimeout(hideHud, 2800);
     } catch {}
   }
 
   function hideHud() {
     clearTimeout(hudT);
-    hudClick = null;
     if (hudBox) hudBox.classList.remove('show');
   }
 
@@ -599,11 +590,20 @@
     // Whichever source is currently producing text wins, in priority order.
     // Sources go quiet (empty string) between cues, so this self-heals when a
     // player switches renderers mid-stream.
+    //
+    // Order matters for correctness, not just quality. What the player RENDERS
+    // is ground truth: it reflects the viewer's subtitle-delay setting, their
+    // chosen language, and any re-timing the player applied. `timedtext` is the
+    // raw subtitle file straight off the network — original timings, no offset,
+    // and possibly not even the selected track. Ranking it first meant a viewer
+    // who had nudged subtitle timing in the site's own player got the unshifted
+    // file mirrored into the pop-out, permanently out of sync with the audio.
+    // It is now the last resort, used only when nothing else is producing.
     _set(kind, text) {
       text = (text || '').replace(/\n{2,}/g, '\n').trim();
       if (this._src[kind] === text) return;
       this._src[kind] = text;
-      const resolved = this._src.timedtext || this._src.cue || this._src.hook || this._src.dom || '';
+      const resolved = this._src.dom || this._src.cue || this._src.hook || this._src.timedtext || '';
       if (resolved === this.text) return;
       if (resolved) this._everHadText = true;
       this.text = resolved;
@@ -1271,13 +1271,16 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
       document.body.appendChild(c);
       const ctx = c.getContext('2d', { alpha: false, desynchronized: true });
 
-      this.subs = new SubtitleEngine(v);
-      this.subs.start();
-
       const out = this.out = document.createElement('video');
       out.muted = true; out.playsInline = true;
       // Off-screen, but never display:none — PiP refuses a non-rendered element.
       out.style.cssText = 'position:fixed;left:-10000px;top:0;width:320px;height:180px;opacity:0.01;pointer-events:none;';
+      // Paint one frame BEFORE capturing, so the stream carries content from its
+      // very first tick. Everything between the user's click and
+      // requestPictureInPicture() below spends transient user activation, which
+      // Chrome expires after ~5s — that is what used to make the request fail
+      // and force a confirmation prompt. Nothing slow may go above that call.
+      try { ctx.drawImage(v, 0, 0, c.width, c.height); } catch {}
       out.srcObject = c.captureStream(30);
       document.body.appendChild(out);
       out.play().catch(() => {});   // never awaited: a frameless stream never resolves
@@ -1310,54 +1313,59 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
       };
       drawFrame();
 
-      // The canvas stream needs real frames before PiP will accept the element.
+      // PiP refuses an element with no frames, so we still have to wait — but a
+      // frame was already painted above, so this resolves in a tick or two. The
+      // budget is deliberately small: overrunning it costs the user activation.
       const ready = await new Promise((resolve) => {
         const t0 = Date.now();
         const iv = setInterval(() => {
           if (out.videoWidth > 0 && out.readyState >= 2) { clearInterval(iv); resolve(true); }
-          else if (Date.now() - t0 > 4000) { clearInterval(iv); resolve(false); }
-        }, 60);
+          else if (Date.now() - t0 > 1200) { clearInterval(iv); resolve(false); }
+        }, 20);
       });
       if (!ready) throw new Error('canvas-stream-no-frames');
 
-      // Two-way play/pause sync. The window's buttons act on the mirror element;
-      // forcing it to stay playing pinned the button to "pause" forever, so a
-      // second click could never mean "play". Instead the mirror follows the
-      // source, and user intent on the mirror is forwarded to the source.
-      // The mirror is a live MediaStream: once paused it will not resume cleanly,
-      // and while it is paused the window's button stays stuck on one action. So
-      // the mirror never pauses — it keeps carrying frames — and any press is
-      // treated as a toggle applied to the real video.
-      // Pressing the window's play/pause button pauses the element it hosts —
-      // our mirror. That event is the only reliable signal of intent (Media
-      // Session actions are not delivered for a MediaStream-backed element), so
-      // it drives the toggle, and the mirror is immediately resumed so the
-      // picture never freezes.
-      // The window's transport buttons act on the element it hosts — the mirror.
-      // Mirror state is simply forwarded to the real video, and vice versa, so
-      // the buttons behave exactly as the viewer expects. The draw loop keeps
-      // running while paused, so the mirror can always be resumed.
-      out.addEventListener('pause', () => {
-        if (!this.closed && !this._syncing && !v.paused) { this._lastAction = 'user paused'; v.pause(); }
-      });
-      out.addEventListener('play', () => {
-        if (!this.closed && !this._syncing && v.paused) {
-          this._lastAction = 'user played';
-          v.play().catch((e) => { this._lastAction = 'play rejected: ' + e.name; });
-        }
-      });
-      const mirrorFollow = (paused) => {
-        this._syncing = true;
-        (paused ? out.pause() : out.play().catch(() => {}));
-        setTimeout(() => { this._syncing = false; }, 80);
-      };
-      this._onSrcPause = () => mirrorFollow(true);
-      this._onSrcPlay = () => mirrorFollow(false);
-      v.addEventListener('pause', this._onSrcPause);
-      v.addEventListener('play', this._onSrcPlay);
-
+      // Consume the activation NOW, before subtitles or anything else runs.
       await out.requestPictureInPicture();
       out.addEventListener('leavepictureinpicture', () => this.close(), { once: true });
+
+      this.subs = new SubtitleEngine(v);
+      this.subs.start();
+
+      /* Play/pause sync.
+       *
+       * The PiP window's buttons act on the element it hosts — the mirror — so
+       * the mirror must track `v.paused` exactly or the button shows the wrong
+       * action. That makes the two elements drive each other, and the old guard
+       * was a window (`_syncing` cleared on an 80ms timer): if an event landed
+       * late it was read as user intent and toggled playback back, which is the
+       * stale/fighting state. The guard is now an explicit expectation, so it
+       * cannot expire early or late — exactly one event is ever swallowed.
+       */
+      const applyToMirror = (paused) => {
+        if (paused === out.paused) return;
+        this._expect = paused ? 'pause' : 'play';
+        if (paused) out.pause();
+        else out.play().catch(() => { this._expect = null; });
+      };
+      const fromMirror = (paused) => {
+        if (this.closed) return;
+        if (this._expect === (paused ? 'pause' : 'play')) { this._expect = null; return; }
+        this._expect = null;
+        this._lastAction = paused ? 'user paused' : 'user played';
+        if (paused === v.paused) return;             // already in the wanted state
+        if (paused) v.pause();
+        else v.play().catch((e) => { this._lastAction = 'play rejected: ' + e.name; });
+      };
+
+      out.addEventListener('pause', () => fromMirror(true));
+      out.addEventListener('play', () => fromMirror(false));
+      this._onSrcPause = () => applyToMirror(true);
+      this._onSrcPlay = () => applyToMirror(false);
+      v.addEventListener('pause', this._onSrcPause);
+      v.addEventListener('play', this._onSrcPlay);
+      applyToMirror(v.paused);                       // start already in sync
+
       this._wireMediaSession();
       this._hideSource();
       send({ type: 'FLOX_OPENED', title: document.title });
@@ -1375,10 +1383,9 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
 
       const set = (name, fn) => { try { ms.setActionHandler(name, fn); } catch {} };
       const claim = () => {
-        // Position/state publishing only — the mirror's own pause event carries
-        // the button press, and handling it in both places double-toggles.
-        set('play', () => { if (v.paused) v.play().catch(() => {}); });
-        set('pause', () => { if (!v.paused) v.pause(); });
+        // No play/pause handlers. The mirror's own pause/play event already
+        // carries the button press; handling it here as well toggled twice and
+        // left the two elements fighting.
         set('seekbackward', (d) => { v.currentTime = Math.max(0, v.currentTime - ((d && d.seekOffset) || 10)); });
         set('seekforward', (d) => { v.currentTime = Math.min(v.duration || 1e9, v.currentTime + ((d && d.seekOffset) || 10)); });
         set('seekto', (d) => { if (d && d.seekTime != null) v.currentTime = d.seekTime; });
@@ -1444,7 +1451,7 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
       this._hidden = null;
       if (this._msTimer) { clearInterval(this._msTimer); this._msTimer = null; }
       if (this._msSaved) {
-        for (const a of ['play', 'pause', 'seekbackward', 'seekforward', 'seekto']) {
+        for (const a of ['seekbackward', 'seekforward', 'seekto']) {
           try { navigator.mediaSession.setActionHandler(a, null); } catch {}
         }
         this._msSaved = false;
@@ -1570,21 +1577,11 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
    * ======================================================================= */
   let current = null;
 
-  // Both pop-out APIs demand *transient user activation* in this frame. A
-  // keypress carries it; a script injected in response to a toolbar click does
-  // not, on every engine. So when the browser refuses on those grounds we don't
-  // fail — we put a click target on the page, and that click carries the real
-  // activation the API wants.
-  const NEEDS_GESTURE = /user activation|NotAllowedError|user gesture|transient/i;
-
-  function armGesture() {
-    hud('Flox: click here to pop out the video', () => {
-      toggle({ force: true }).then((r) => {
-        if (!r.ok && r.reason !== 'needs-gesture') hud(explain(r.reason));
-      }).catch(() => {});
-    });
-  }
-
+  // Pop-out is never gated behind a confirmation. Both PiP APIs need transient
+  // user activation, which expires ~5s after the click, so every session path
+  // must reach its request call immediately — see CanvasFallbackSession.open().
+  // If one still gets refused we report it and stop; we do not ask the user to
+  // click again.
   const REASONS = {
     'no-video': 'Flox: no video found on this page.',
     'not-playing': 'Flox: the video is paused — start it, then try again.',
@@ -1635,13 +1632,7 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
     } catch (e) {
       current = null;
       try { session.close(); } catch {}
-      const name = (e && e.name) || '';
-      const reason = String((e && e.message) || e);
-      if (name === 'NotAllowedError' || NEEDS_GESTURE.test(reason)) {
-        armGesture();
-        return { ok: false, score, reason: 'needs-gesture' };
-      }
-      return { ok: false, score, reason };
+      return { ok: false, score, reason: String((e && e.message) || e) };
     }
   }
 
@@ -1650,7 +1641,6 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
     // The worker arbitrates between frames, so it — not this frame — is the one
     // that knows a toggle failed everywhere. It reports back through here.
     notify: (reason) => { hud(explain(reason)); },
-    armGesture,
     isOpen: () => !!current,
     close: () => { current && current.close(); },
     probe: () => pickVideo().score,
@@ -1695,7 +1685,7 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
     const { video, score } = pickVideo();
     if (video && score > 0) {
       toggle({ force: true }).then((r) => {
-        if (!r.ok && r.reason !== 'needs-gesture') hud(explain(r.reason));
+        if (!r.ok) hud(explain(r.reason));
       }).catch((err) => hud(explain(String(err && err.message || err))));
     } else {
       // No video in this frame — let the worker find the frame that has one.
