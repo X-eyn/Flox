@@ -236,6 +236,10 @@
   const CLOCK = /^\s*\d+:\d{2}(:\d{2})?\s*(\/|of|-)?\s*(\d+:\d{2}(:\d{2})?)?\s*$/;
   const isDialogue = (t) => !!t && !CLOCK.test(t) && /\p{L}/u.test(t);
 
+  // How far back to look for a cue that is still on screen. Long enough for a
+  // song or a held sign translation, short enough to bound the scan.
+  const MAX_CUE_SPAN = 30;
+
   class SubtitleEngine {
     constructor(video) {
       this.video = video;
@@ -258,6 +262,7 @@
       this._ttOffset = null;                       // measured retiming, seconds; null = uncalibrated
       this._offSamples = [];                       // recent offset measurements, seconds
       this._shiftDone = false;                     // track-vs-file comparison already concluded
+      this._seekAt = null;                         // last seek, for suppressing measurements
       this._lastMutated = null;                    // root whose TEXT changed most recently
       this._readQueued = false;
       this.onRoot = () => {};                      // notified as roots are adopted
@@ -337,11 +342,25 @@
       if (this._ttTimer) return;
       const tick = () => {
         if (this._destroyed) return;
-        const t = this.video.currentTime;
-        this._set('timedtext', this._ttAt(t));
+        this._set('timedtext', this._ttAt(this.video.currentTime));
       };
-      this._ttTimer = setInterval(tick, 120);
-      this._observers.push(() => clearInterval(this._ttTimer));
+      // 120ms left every cue boundary up to a frame and a half late, which is
+      // what read as roughness. Seeks are handled by event rather than by
+      // waiting for the next tick, so the line never lags a jump.
+      this._ttTimer = setInterval(tick, 50);
+      this._onTtSeek = () => { this._seekAt = performance.now(); tick(); };
+      const v = this.video;
+      try {
+        v.addEventListener('seeking', this._onTtSeek);
+        v.addEventListener('seeked', this._onTtSeek);
+      } catch {}
+      this._observers.push(() => {
+        clearInterval(this._ttTimer);
+        try {
+          v.removeEventListener('seeking', this._onTtSeek);
+          v.removeEventListener('seeked', this._onTtSeek);
+        } catch {}
+      });
       tick();
     }
 
@@ -407,7 +426,12 @@
       // Prefer the position stamped at the mutation; fall back to now, which is
       // simply a later — and therefore larger — sample, which the minimum below
       // discards on its own.
+      // A caption rendered before a seek, read after it, yields a sample that is
+      // wrong by the whole jump. One of those can drag the estimate off for the
+      // rest of the session, so measurement stops across a seek entirely.
+      if (this.video.seeking) return;
       const fresh = this._mutAt != null && (performance.now() - this._mutAt) < 400;
+      if (this._seekAt != null && performance.now() - this._seekAt < 1200) return;
       const now = fresh ? this._mutT : this.video.currentTime;
       if (!isFinite(now)) return;
       const key = this._norm(domText);
@@ -456,11 +480,18 @@
         const mid = (lo + hi) >> 1;
         if (c[mid].s <= t) { idx = mid; lo = mid + 1; } else hi = mid - 1;
       }
+      if (idx < 0) return '';
+      // Walk back by TIME, not by a fixed number of cues. A long-running cue —
+      // a song, a sign translation, "(alarm blaring)" held over dialogue — can
+      // start many cues before the current one, and stopping after five indexes
+      // dropped it off screen while it was still supposed to be showing.
       const parts = [];
-      for (let i = Math.max(0, idx - 4); i <= idx && i >= 0; i++) {
+      for (let i = idx; i >= 0; i--) {
         const cue = c[i];
-        if (cue && cue.s <= t && cue.e >= t) parts.push(cue.t);
+        if (t - cue.s > MAX_CUE_SPAN) break;
+        if (cue.s <= t && cue.e >= t) parts.push(cue.t);
       }
+      parts.reverse();                    // walked backwards; restore reading order
       return [...new Set(parts)].join('\n');
     }
 

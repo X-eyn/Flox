@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Flox — Pop Out Player with Subtitles",
-  "version": "1.8.0",
+  "version": "1.8.1",
   "description": "Pop out any video into a smooth always-on-top window, with the host player's subtitles mirrored live. Works on YouTube, Netflix, and everything else.",
   "minimum_chrome_version": "116",
   "permissions": ["storage", "scripting", "activeTab", "tabs"],
