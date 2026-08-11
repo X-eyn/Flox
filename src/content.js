@@ -18,12 +18,15 @@
   const hasDocPiP = 'documentPictureInPicture' in window;
 
   /* ---------------------------------------------------------------- utils */
-  const vis = (el) => {
+  // `softOpacity` keeps a mid-fade element visible. Players fade caption boxes
+  // in and out, so treating opacity 0 as gone clears the overlay mid-cue.
+  const vis = (el, softOpacity) => {
     if (!el || !el.isConnected) return false;
     const r = el.getBoundingClientRect();
     if (r.width < 2 || r.height < 2) return false;
     const cs = getComputedStyle(el);
-    return cs.visibility !== 'hidden' && cs.display !== 'none' && cs.opacity !== '0';
+    return cs.visibility !== 'hidden' && cs.display !== 'none' &&
+           (softOpacity || cs.opacity !== '0');
   };
   const clamp = (n, a, b) => Math.min(b, Math.max(a, n));
 
@@ -36,11 +39,65 @@
       .replace(/<br\s*\/?>/gi, '\n')
       .replace(/<\/?[^>]+>/g, '')
       .replace(/&(#?\w+);/g, (m, e) => (e in ENTITIES ? ENTITIES[e]
-        : /^#\d+$/.test(e) ? String.fromCharCode(+e.slice(1)) : m))
+        : /^#\d+$/.test(e) ? String.fromCharCode(+e.slice(1))
+        : /^#x[0-9a-f]+$/i.test(e) ? String.fromCharCode(parseInt(e.slice(2), 16)) : m))
       .replace(/\n{2,}/g, '\n')
       .trim();
   }
   const send = (msg) => { try { chrome.runtime.sendMessage(msg); } catch {} };
+
+  /* ----------------------------------------------------------------- HUD ---
+   * Every failure path used to end in a swallowed result object, so a click
+   * that couldn't work looked exactly like a click that did nothing. This is a
+   * shadow-DOM overlay so no host stylesheet can hide or restyle it, and it is
+   * also the click target for the user-activation fallback below.
+   * ------------------------------------------------------------------------ */
+  const HUD_CSS = `
+#b{font:600 13px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:#eef2f8;
+  background:rgba(14,17,23,.95);border:1px solid rgba(255,255,255,.13);border-radius:10px;
+  padding:9px 13px;box-shadow:0 10px 30px rgba(0,0,0,.5);max-width:330px;
+  opacity:0;transform:translateY(-6px);transition:opacity .16s ease,transform .16s ease}
+#b.show{opacity:1;transform:none}
+#b.act{cursor:pointer;border-color:#5b8cff;background:rgba(20,28,48,.97)}
+#b.act:hover{background:rgba(28,40,66,.97)}`;
+
+  let hudHost = null, hudBox = null, hudT = 0, hudClick = null;
+
+  function hud(msg, onClick) {
+    try {
+      const root = document.documentElement;
+      if (!root || !msg) return;
+      if (!hudHost || !hudHost.isConnected) {
+        hudHost = document.createElement('div');
+        hudHost.setAttribute('data-flox-hud', '1');
+        hudHost.style.cssText =
+          'all:initial;position:fixed;top:14px;right:14px;z-index:2147483647;';
+        const sr = hudHost.attachShadow({ mode: 'open' });
+        const st = document.createElement('style');
+        st.textContent = HUD_CSS;
+        hudBox = document.createElement('div');
+        hudBox.id = 'b';
+        hudBox.addEventListener('click', () => {
+          const fn = hudClick;
+          if (fn) { hudClick = null; hideHud(); fn(); }
+        });
+        sr.append(st, hudBox);
+        root.appendChild(hudHost);
+      }
+      hudBox.textContent = msg;
+      hudClick = typeof onClick === 'function' ? onClick : null;
+      hudBox.classList.toggle('act', !!hudClick);
+      hudBox.classList.add('show');
+      clearTimeout(hudT);
+      hudT = setTimeout(hideHud, hudClick ? 9000 : 2800);
+    } catch {}
+  }
+
+  function hideHud() {
+    clearTimeout(hudT);
+    hudClick = null;
+    if (hudBox) hudBox.classList.remove('show');
+  }
 
   // exitPictureInPicture() REJECTS a promise when nothing is in PiP — a plain
   // try/catch cannot catch that, which is why it surfaced as an uncaught
@@ -120,8 +177,26 @@
 
   function pickVideo() {
     let best = null, bestScore = 0;
-    for (const v of allVideos()) {
+    const all = allVideos();
+    for (const v of all) {
       const s = scoreVideo(v);
+      if (s > bestScore) { best = v; bestScore = s; }
+    }
+    if (best) return { video: best, score: bestScore };
+
+    // Relaxed pass. scoreVideo() requires a laid-out, visible element, which a
+    // real player can legitimately fail: zero-sized until the first frame,
+    // opacity 0 behind a poster/ad overlay, or scaled to nothing by a custom
+    // renderer. Anything holding an actual media resource is still poppable, so
+    // rather than reporting "no video" we rank what we have. These scores stay
+    // below the visible tier so a visible video in another frame always wins.
+    for (const v of all) {
+      let s = 0;
+      if (!v.paused && !v.ended) s += 40;
+      if (v.readyState >= 2) s += 20;
+      if (v.currentTime > 0) s += 10;
+      if (v.videoWidth > 0) s += 10;
+      if (v.currentSrc || v.src || v.srcObject) s += 5;
       if (s > bestScore) { best = v; bestScore = s; }
     }
     return { video: best, score: bestScore };
@@ -179,7 +254,12 @@
       // itself downloaded — exact text and timings, immune to DOM changes.
       this._src = { timedtext: '', cue: '', hook: '', dom: '' };
       this._obs = new Map();                       // element -> MutationObserver
+      this._produced = new Set();                  // roots that have ever yielded text
+      this._seen = new Map();                      // root -> { last, changed }
+      this._everHadText = false;                   // any source has ever resolved text
+      this._lastMutated = null;                    // root whose TEXT changed most recently
       this._readQueued = false;
+      this.onRoot = () => {};                      // notified as roots are adopted
     }
 
     // Mutations arrive in bursts (a player repaints its caption box many times
@@ -240,8 +320,13 @@
      */
     _loadTimedText(cues) {
       if (!Array.isArray(cues) || !cues.length) return;
+      // Sites prefetch subtitle files for other servers, episodes and languages,
+      // so the last file to arrive is not necessarily the one playing. Since
+      // `timedtext` is the highest-priority source, letting a background fetch
+      // replace a working list swaps correct subtitles for wrong ones. Keep a
+      // list that is currently producing text.
+      if (this._tt && this._src.timedtext) return;
       this._tt = cues;
-      this._ttIdx = 0;
       if (this._ttTimer) return;
       const tick = () => {
         if (this._destroyed) return;
@@ -276,6 +361,19 @@
     _bindTracks() {
       const tt = this.video.textTracks;
       if (!tt) return;
+
+      // Reconcile what we already hold. We park our tracks at 'hidden', so any
+      // other mode means the player changed it — the viewer turned subtitles
+      // off, or switched language. Release it and clear the line, otherwise the
+      // last cue sticks on screen forever AND (since `cue` outranks `hook` and
+      // `dom`) blocks every lower-priority source from ever showing again.
+      for (const [track, st] of [...this._trackState]) {
+        if (track.mode === 'hidden') continue;
+        try { track.removeEventListener('cuechange', st.h); } catch {}
+        this._trackState.delete(track);
+        this._set('cue', '');
+      }
+
       for (const track of tt) {
         if (this._trackState.has(track)) continue;
         // Never consume our own bridge track — the engine feeds it, and taking
@@ -285,15 +383,14 @@
         // Only mirror a track the player actually turned on; take over rendering
         // (hidden = cues still fire, UA stops drawing them) so styling is ours.
         if (track.mode !== 'showing') continue;
-        this._trackState.set(track, track.mode);
-        track.mode = 'hidden';
         const h = () => {
           const parts = [];
           for (const c of track.activeCues || []) parts.push(this._cueText(c));
           this._set('cue', parts.filter(Boolean).join('\n'));
         };
+        this._trackState.set(track, { mode: track.mode, h });
+        track.mode = 'hidden';
         track.addEventListener('cuechange', h);
-        this._observers.push(() => track.removeEventListener('cuechange', h));
         h();
       }
     }
@@ -321,16 +418,25 @@
       // Name-based matching fails on players that style captions with utility
       // classes (cinejoy renders them into plain Tailwind divs). Fall back to
       // shape: short text, few children, sitting over the lower part of the video.
-      if (!candidates.size) for (const el of this._positionalCandidates(container)) candidates.add(el);
+      //
+      // Gating this on `!candidates.size` was wrong: GENERIC_SEL matches on
+      // substrings like "caption", so a captions *menu* or a "no captions
+      // available" notice was enough to make the set non-empty and suppress the
+      // only truly generic tier. What matters is whether anything found by name
+      // has ever produced text — not whether anything matched.
+      //
+      // But it must also stop once ANY source is working, otherwise every
+      // silence looks like failure and the sweep keeps adopting player chrome
+      // that sits in the caption area.
+      if (!this._produced.size && !this._everHadText) {
+        for (const el of this._positionalCandidates(container)) candidates.add(el);
+      }
 
       // Prune roots the site has thrown away, or we accumulate observers forever.
-      for (const [el, mo] of this._obs) {
-        if (!el.isConnected) { mo.disconnect(); this._obs.delete(el); this._domRoots.delete(el); }
-      }
+      for (const el of [...this._obs.keys()]) if (!el.isConnected) this._drop(el);
 
       for (const el of candidates) {
         if (this._domRoots.has(el)) continue;
-        if (this._domRoots.size >= MAX_SUB_ROOTS) break;   // hard cap — see below
         if (el.contains(this.video) || el === this.video) continue;
         if (el.tagName === 'VIDEO' || el.tagName === 'BUTTON' || el.closest('button')) continue;
         const r = el.getBoundingClientRect();
@@ -339,11 +445,30 @@
         // mutation is what wedges a tab. Caption containers are tiny; anything
         // large is not one.
         if (el.getElementsByTagName('*').length > 60) continue;
+
+        // At the cap, surrender a slot held by a root that has never produced
+        // text. Evicting only on disconnect meant eight wrong-but-attached
+        // elements — easily picked before the real caption container exists —
+        // locked the engine out for the rest of the session.
+        if (this._domRoots.size >= MAX_SUB_ROOTS) {
+          const dead = [...this._domRoots].find(x => !this._produced.has(x));
+          if (!dead) break;
+          this._drop(dead);
+        }
+
         this._domRoots.add(el);
-        const mo = new MutationObserver(() => this._queueRead());
+        // Only content changes make a root "hot". Attribute churn (style/class)
+        // is animation and state toggling — page chrome does it constantly, and
+        // counting it let an animated UI element win the recency check forever.
+        const mo = new MutationObserver((recs) => {
+          if (recs.some(r => r.type === 'childList' || r.type === 'characterData')) {
+            this._lastMutated = el;
+          }
+          this._queueRead();
+        });
         mo.observe(el, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['style', 'class'] });
         this._obs.set(el, mo);
-        this._observers.push(() => mo.disconnect());
+        this.onRoot(el);
       }
       this._scanCanvas(container);
       this._readDom();
@@ -387,12 +512,46 @@
       return out;
     }
 
+    _drop(el) {
+      const mo = this._obs.get(el);
+      if (mo) { try { mo.disconnect(); } catch {} }
+      this._obs.delete(el);
+      this._domRoots.delete(el);
+      this._produced.delete(el);
+      this._seen.delete(el);
+      if (this._lastMutated === el) this._lastMutated = null;
+    }
+
+    // A root is trusted only once its text has been observed to CHANGE. Player
+    // chrome that happens to sit in the caption area holds one constant string;
+    // real captions always change. Without this, an adopted chrome element was
+    // rendered as a permanent subtitle through every silence.
+    _rootText(el) {
+      const t = this._extract(el);
+      let st = this._seen.get(el);
+      if (!st) { this._seen.set(el, { last: t, changed: false }); return ''; }
+      if (t !== st.last) { st.last = t; st.changed = true; }
+      return st.changed ? t : '';
+    }
+
     _readDom() {
+      // Prefer the root whose text just changed. Captions mutate every few
+      // seconds; page chrome does not. The old rule — longest text wins — let a
+      // static title or description outrank the real two-word caption forever.
+      const hot = this._lastMutated;
+      if (hot && this._domRoots.has(hot) && hot.isConnected && vis(hot, true)) {
+        const t = this._rootText(hot);
+        if (t) { this._produced.add(hot); this._set('dom', t); return; }
+      }
       let best = '';
       for (const el of this._domRoots) {
-        if (!el.isConnected || !vis(el)) continue;
-        const t = this._extract(el);
-        if (t && t.length > best.length) best = t;
+        // Opacity is ignored here: players fade caption boxes in and out, and
+        // treating mid-fade as invisible cleared the overlay in the middle of
+        // a cue.
+        if (!el.isConnected || !vis(el, true)) continue;
+        const t = this._rootText(el);
+        if (t) this._produced.add(el);
+        if (t && t.length > best.length) { best = t; bestEl = el; }
       }
       this._set('dom', best);
     }
@@ -446,6 +605,7 @@
       this._src[kind] = text;
       const resolved = this._src.timedtext || this._src.cue || this._src.hook || this._src.dom || '';
       if (resolved === this.text) return;
+      if (resolved) this._everHadText = true;
       this.text = resolved;
       this.onText(resolved);
     }
@@ -475,9 +635,15 @@
         tt.removeEventListener('addtrack', this._trackAddL);
         tt.removeEventListener('change', this._trackAddL);
       } catch {}
-      for (const [track, mode] of this._trackState) { try { track.mode = mode; } catch {} }
+      for (const [track, st] of this._trackState) {
+        try { track.removeEventListener('cuechange', st.h); } catch {}
+        try { track.mode = st.mode; } catch {}
+      }
       this._trackState.clear();
       this._domRoots.clear();
+      this._produced.clear();
+      this._seen.clear();
+      this._lastMutated = null;
     }
   }
 
@@ -892,9 +1058,9 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
 
       this.win.addEventListener('keydown', (e) => {
         const k = e.key.toLowerCase();
-        // Alt+P closes from inside the window too, so the same key toggles
+        // Alt+, closes from inside the window too, so the same key toggles
         // regardless of which window has focus.
-        if (e.altKey && k === 'p') { e.preventDefault(); this.close(); return; }
+        if (e.altKey && (e.code === 'Comma' || k === ',')) { e.preventDefault(); this.close(); return; }
         const map = {
           ' ': () => this.playPause(),
           k: () => this.playPause(),
@@ -1255,11 +1421,17 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
         el.style.setProperty('visibility', 'hidden', 'important');
       };
       if (prof) { try { document.querySelectorAll(prof.sel).forEach(hide); } catch {} }
-      if (this.subs) for (const el of this.subs._domRoots) hide(el);
+      if (this.subs) {
+        for (const el of this.subs._domRoots) hide(el);
+        // The engine keeps discovering roots every few seconds after this point.
+        // Without hiding those too, late captions float over a hidden video.
+        this.subs.onRoot = hide;
+      }
     }
 
     _restoreSource() {
       const v = this.video;
+      if (this.subs) this.subs.onRoot = () => {};
       try { v.removeEventListener('play', this._onSrcPlay); } catch {}
       try { v.removeEventListener('pause', this._onSrcPause); } catch {}
       try {
@@ -1398,6 +1570,34 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
    * ======================================================================= */
   let current = null;
 
+  // Both pop-out APIs demand *transient user activation* in this frame. A
+  // keypress carries it; a script injected in response to a toolbar click does
+  // not, on every engine. So when the browser refuses on those grounds we don't
+  // fail — we put a click target on the page, and that click carries the real
+  // activation the API wants.
+  const NEEDS_GESTURE = /user activation|NotAllowedError|user gesture|transient/i;
+
+  function armGesture() {
+    hud('Flox: click here to pop out the video', () => {
+      toggle({ force: true }).then((r) => {
+        if (!r.ok && r.reason !== 'needs-gesture') hud(explain(r.reason));
+      }).catch(() => {});
+    });
+  }
+
+  const REASONS = {
+    'no-video': 'Flox: no video found on this page.',
+    'not-playing': 'Flox: the video is paused — start it, then try again.',
+    'drm-move-failed': 'Flox: this player is DRM-protected. Turn on “use the browser’s own PiP window” in Flox settings.',
+    'pip-window-timeout': 'Flox: the browser never opened the pop-out window. Try again.',
+    'mount-timeout': 'Flox: the player did not hand over its video in time.',
+    'capture-unavailable': 'Flox: this video cannot be captured.',
+    'video-transfer-failed': 'Flox: this player refused to release its video.',
+    'canvas-stream-no-frames': 'Flox: no frames from this player — try again once it is playing.',
+    'native-pip-disabled': 'Flox: picture-in-picture is disabled in your browser settings.'
+  };
+  const explain = (reason) => REASONS[reason] || ('Flox: could not pop out (' + reason + ')');
+
   async function toggle({ force = false, settings } = {}) {
     if (settings) S = { ...S, ...settings };
 
@@ -1435,12 +1635,22 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
     } catch (e) {
       current = null;
       try { session.close(); } catch {}
-      return { ok: false, score, reason: String(e && e.message || e) };
+      const name = (e && e.name) || '';
+      const reason = String((e && e.message) || e);
+      if (name === 'NotAllowedError' || NEEDS_GESTURE.test(reason)) {
+        armGesture();
+        return { ok: false, score, reason: 'needs-gesture' };
+      }
+      return { ok: false, score, reason };
     }
   }
 
   globalThis.__FLOX__ = {
     toggle,
+    // The worker arbitrates between frames, so it — not this frame — is the one
+    // that knows a toggle failed everywhere. It reports back through here.
+    notify: (reason) => { hud(explain(reason)); },
+    armGesture,
     isOpen: () => !!current,
     close: () => { current && current.close(); },
     probe: () => pickVideo().score,
@@ -1459,10 +1669,11 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
   };
 
   /* -------------------------------------------------------------- hotkey ---
-   * Alt+P is handled here, in the page, rather than through chrome.commands.
+   * Alt+, is handled here, in the page, rather than through chrome.commands.
    * A real keypress carries its own user activation, so requestWindow() is
    * allowed — and it can't be lost to a shortcut-registration conflict with
    * another extension, which is how command-based hotkeys silently die.
+   * (Alt+P was the old binding; Opera GX claims it for its own settings page.)
    * ------------------------------------------------------------------------ */
   function isTyping(el) {
     if (!el) return false;
@@ -1472,7 +1683,10 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
 
   function onHotkey(e) {
     if (!e.altKey || e.ctrlKey || e.metaKey) return;
-    if ((e.key || '').toLowerCase() !== 'p' && e.code !== 'KeyP') return;
+    // Match on physical key first: Alt on some layouts rewrites e.key entirely
+    // (AltGr composition, non-US layouts), and e.code stays stable across all
+    // of them. e.key is only the fallback for layouts that remap the position.
+    if (e.code !== 'Comma' && e.key !== ',' && e.key !== '<') return;
     if (isTyping(e.target) || isTyping(document.activeElement)) return;
     e.preventDefault();
     e.stopImmediatePropagation();
@@ -1480,7 +1694,9 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
     if (current) { current.close(); return; }
     const { video, score } = pickVideo();
     if (video && score > 0) {
-      toggle({ force: true }).catch(() => {});
+      toggle({ force: true }).then((r) => {
+        if (!r.ok && r.reason !== 'needs-gesture') hud(explain(r.reason));
+      }).catch((err) => hud(explain(String(err && err.message || err))));
     } else {
       // No video in this frame — let the worker find the frame that has one.
       send({ type: 'FLOX_HOTKEY' });

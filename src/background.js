@@ -49,7 +49,69 @@ function invokeToggle(force, settings) {
   }
 }
 
-export async function togglePiP(tabId) {
+/** Injected to ask a frame whether the content script is present. */
+function probePresence() {
+  return !!globalThis.__FLOX__;
+}
+
+/** Injected to show a message on the page when the toggle failed everywhere. */
+function reportFailure(reason) {
+  const api = globalThis.__FLOX__;
+  // Only the top frame speaks for the tab; an overlay per iframe would stack.
+  if (!api || !api.notify || window.top !== window) return false;
+  api.notify(reason);
+  return true;
+}
+
+const RESTRICTED = /^(chrome|edge|opera|about|devtools|view-source|moz-extension|chrome-extension):/i;
+
+/**
+ * The single most common way this extension "did nothing": the tab was already
+ * open when the extension was installed, updated or reloaded, so no content
+ * script was ever injected into it and every call found `__FLOX__` undefined.
+ * Manifest `content_scripts` only cover *future* navigations. So we check, and
+ * inject on demand into whatever is already open.
+ */
+async function ensureInjected(tabId) {
+  let present = [];
+  try {
+    present = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true }, func: probePresence
+    });
+  } catch (e) {
+    return { ok: false, reason: 'inject-failed: ' + e.message };
+  }
+  if (present.some(r => r.result)) return { ok: true };
+
+  // Inject both worlds, in the same order the manifest would have.
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true }, world: 'MAIN', files: ['src/page-hook.js']
+    });
+  } catch {}   // page-hook is an enhancement; its absence must not block a pop-out
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true }, files: ['src/content.js']
+    });
+  } catch (e) {
+    return { ok: false, reason: 'inject-failed: ' + e.message };
+  }
+  return { ok: true };
+}
+
+export async function togglePiP(tabId, { report = true } = {}) {
+  const res = await runToggle(tabId);
+  if (!res.ok && report) await reportToUser(tabId, res.reason);
+  return res;
+}
+
+async function runToggle(tabId) {
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (tab && RESTRICTED.test(tab.url || '')) return { ok: false, reason: 'restricted-page' };
+
+  const ready = await ensureInjected(tabId);
+  if (!ready.ok) return ready;
+
   const settings = await getSettings();
   let results = [];
   try {
@@ -71,7 +133,14 @@ export async function togglePiP(tabId) {
     const s = r.result && r.result.score || 0;
     if (s > 0 && (!best || s > best.score)) best = { frameId: r.frameId, score: s };
   }
-  if (!best) return { ok: false, reason: 'no-video' };
+  // No frame scored. Surface the most specific reason any frame gave rather
+  // than a blanket "no-video" — "not-playing" and "no-content-script" are
+  // actionable, and collapsing them is what made failures unreadable.
+  if (!best) {
+    const reasons = results.map(r => r.result && r.result.reason).filter(Boolean);
+    const pick = reasons.find(x => x !== 'no-video' && x !== 'no-content-script');
+    return { ok: false, reason: pick || reasons[0] || 'no-video' };
+  }
 
   const forced = await chrome.scripting.executeScript({
     target: { tabId, frameIds: [best.frameId] },
@@ -79,6 +148,29 @@ export async function togglePiP(tabId) {
     args: [true, settings]
   });
   return (forced[0] && forced[0].result) || { ok: false, reason: 'forced-failed' };
+}
+
+/**
+ * A failed toggle must never be silent. Preferred channel is the content
+ * script's own on-page overlay; when the page is unreachable (restricted URL,
+ * blocked injection) the badge is all we have.
+ */
+async function reportToUser(tabId, reason) {
+  // The frame already showed its own clickable prompt for this one.
+  if (reason === 'needs-gesture') return;
+  try {
+    const res = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true }, func: reportFailure, args: [reason || 'no-video']
+    });
+    if (res.some(r => r.result === true)) return;
+  } catch {}
+  flashBadge(tabId);
+}
+
+function flashBadge(tabId) {
+  chrome.action.setBadgeText({ tabId, text: '!' }).catch(() => {});
+  chrome.action.setBadgeBackgroundColor({ tabId, color: '#d9534f' }).catch(() => {});
+  setTimeout(() => chrome.action.setBadgeText({ tabId, text: '' }).catch(() => {}), 3000);
 }
 
 // Clicking the toolbar icon pops out immediately — no popup, no second click.
@@ -93,7 +185,7 @@ chrome.commands.onCommand.addListener(async (cmd) => {
   if (tab) togglePiP(tab.id);
 });
 
-// The content script's own Alt+P handler routes here when it can't act locally
+// The content script's own Alt+, handler routes here when it can't act locally
 // (e.g. the key was pressed while a different frame owned the video).
 chrome.runtime.onMessage.addListener((msg, sender) => {
   if (msg && msg.type === 'FLOX_HOTKEY' && sender.tab) togglePiP(sender.tab.id);

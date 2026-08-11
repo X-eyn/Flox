@@ -54,9 +54,16 @@
 
    * ===================================================================== */
 
-  const SUB_URL = /timedtext|dfxp|ttml|imsc|webvtt|\bsubtitle|\/\?o=\d/i;
+  const SUB_URL = /timedtext|dfxp|ttml|imsc|webvtt|\.srt\b|\bsubtitle|\/\?o=\d/i;
+
+  // SRT is the third common wire format on aggregator sites and was silently
+  // dropped here. It differs from WebVTT only in the comma decimal separator
+  // and the numeric index line, both of which parseVTT already tolerates.
+  const SUB_SRT = /^\s*﻿?\d+\s*\r?\n\s*\d{1,2}:\d{2}:\d{2}[.,]\d{1,3}\s*-->/;
 
   const SUB_BODY = /^\s*WEBVTT|<tt[\s>]|<tt:tt[\s>]|xmlns[^>]*ttml/i;
+
+  const SUB_TTML = /<tt[\s>]|<tt:tt[\s>]|xmlns[^>]*ttml/i;
 
   let cues = [];            // {s, e, t} seconds + text, sorted by start
 
@@ -104,7 +111,9 @@
 
     .replace(/&(#?\w+);/g, (m, e) => ({ amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' }[e]
 
-      || (/^#\d+$/.test(e) ? String.fromCharCode(+e.slice(1)) : m)))
+      || (/^#\d+$/.test(e) ? String.fromCharCode(+e.slice(1))
+
+        : /^#x[0-9a-f]+$/i.test(e) ? String.fromCharCode(parseInt(e.slice(2), 16)) : m)))
 
     .replace(/[ \t]+/g, ' ')
 
@@ -184,9 +193,12 @@
 
   function ingest(url, text) {
 
-    if (!text || text.length < 20 || !SUB_BODY.test(text.slice(0, 400))) return;
+    if (!text || text.length < 20) return;
+    const head = text.slice(0, 400);
+    if (!SUB_BODY.test(head) && !SUB_SRT.test(head)) return;
 
-    let parsed = /^\s*WEBVTT/i.test(text) ? parseVTT(text) : parseTTML(text);
+    // TTML is the only format needing its own parser; WebVTT and SRT share one.
+    let parsed = SUB_TTML.test(head) ? parseTTML(text) : parseVTT(text);
 
     if (!parsed.length) return;
 

@@ -9,10 +9,11 @@ real always-on-top window — **with the host player's subtitles mirrored live**
 1. Open `chrome://extensions` (Opera GX: `opera://extensions`).
 2. Turn on **Developer mode**.
 3. **Load unpacked** → select this `flox` folder.
-4. Pin the icon. Click it (or press **Alt+P**) while a video plays.
+4. Pin the icon. Click it (or press **Alt+,**) while a video plays.
 
 > Opera GX: also enable *Allow access to search page results / all sites* if you
-> restricted extension host access. Alt+P can be re-bound at `opera://extensions/shortcuts`.
+> restricted extension host access. Alt+, can be re-bound at `opera://extensions/shortcuts`.
+> (Alt+P — the old binding — is reserved by Opera GX for its own settings page.)
 
 ## How it works
 
@@ -143,7 +144,9 @@ same API fails identically in that environment, so it is the harness, not this c
 - Document PiP requires Chromium **116+**. Older browsers and Firefox fall back to
   classic PiP with subtitles burned into a canvas — that fallback cannot work on
   DRM-protected video (Netflix etc.), which is a platform restriction.
-- The window must be opened from a real user gesture (icon click or Alt+P);
+- The window must be opened from a real user gesture (icon click or Alt+,);
+  when the browser refuses the icon click for lack of one, Flox puts a
+  click-to-pop-out prompt on the page instead of failing silently.
   "auto pop-out when leaving the tab" only works after you've interacted with the page.
 
 ## Layout
