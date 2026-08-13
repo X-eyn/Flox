@@ -67,6 +67,14 @@
 
   let cues = [];            // {s, e, t} seconds + text, sorted by start
 
+  // A payload spanning more than this is a whole subtitle document; anything
+  // narrower is an HLS segment and gets merged into what we already have.
+  const SEGMENT_SPAN = 120;
+
+  const MAX_CUES = 20000;   // bounds memory on a long stream
+
+  let wholeDoc = false;     // is the current list a complete file, or accumulated segments?
+
 
 
   function parseClock(v, tickRate) {
@@ -204,13 +212,39 @@
 
     parsed.sort((a, b) => a.s - b.s);
 
-    cues = parsed;
+    /* HLS delivers a subtitle track as MANY SMALL SEGMENT FILES — a handful of
+     * cues covering ten seconds or so — rather than one document. Replacing the
+     * list per fetch therefore left only the few lines from whichever segment
+     * landed last, which is why subtitles barely appeared on players fed by an
+     * HLS embed. Accumulate segments instead; a whole file still replaces.
+     */
+    const span = parsed[parsed.length - 1].e - parsed[0].s;
+    if (span > SEGMENT_SPAN || parsed.length > 80) {
+      cues = parsed;                                  // a complete document
+      wholeDoc = true;
+    } else if (wholeDoc) {
+      // A segment arriving after a whole document belongs to a different track,
+      // not to that document. Merging the two interleaves two subtitle sets, so
+      // start a fresh accumulation instead.
+      cues = parsed;
+      wholeDoc = false;
+    } else {
+      const key = (c) => c.s.toFixed(3) + '|' + c.e.toFixed(3);
+      const merged = new Map();
+      for (const c of cues) merged.set(key(c), c);
+      for (const c of parsed) merged.set(key(c), c);   // newest wins on a collision
+      cues = [...merged.values()].sort((a, b) => a.s - b.s);
+      if (cues.length > MAX_CUES) cues = cues.slice(-MAX_CUES);
+    }
 
     // The content script owns the video element (which may have been moved into
 
     // a PiP document), so it resolves the current cue. We just hand over the list.
 
-    post({ event: 'timedtext-list', count: cues.length, cues: parsed, url: String(url).slice(0, 120) });
+    // Hand over the ACCUMULATED list, not the payload just parsed. Posting
+    // `parsed` here sent only the newest HLS segment, which would have defeated
+    // the merge above entirely.
+    post({ event: 'timedtext-list', count: cues.length, cues: cues, url: String(url).slice(0, 120) });
 
   }
 

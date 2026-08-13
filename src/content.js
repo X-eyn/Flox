@@ -11,7 +11,8 @@
     subtitleBottom: 6, subtitleShadow: true, opacity: 1, transparencyEnabled: false,
     showControls: true, hoverControls: true, pauseOnClose: false, returnOnClose: true,
     rememberSize: true, lastSize: { width: 640, height: 360 }, mode: 'auto',
-    autoPipOnTabHide: false, keepAspect: true, drmNative: false, forceNative: false, cleanWindow: true
+    autoPipOnTabHide: false, keepAspect: true, drmNative: false, forceNative: false, cleanWindow: true,
+    debugSubs: false  // diagnostic readout on the pop-out; toggle with Alt+D
   };
 
   let S = { ...DEFAULTS };
@@ -276,6 +277,7 @@
       this._seekAt = null;                         // last seek, for suppressing measurements
       this._startedAt = null;                      // engine start, for the settle guard
       this._mismatch = 0;                          // consecutive dom-vs-file disagreements
+      this._hookReady = false;                     // page-world hook seen in this frame
       this._lastCalText = null;                    // last line the calibrator saw displayed
       this._calEl = null;                          // cached caption element
       this._lastWalkAt = null;                     // throttles the full search
@@ -315,7 +317,16 @@
       // once a source is actually producing text instead of running forever.
       const tick = () => {
         if (this._destroyed) return;
-        this._scanDom();
+        // Re-check tracks, not just the DOM. Binding ran only at start and on
+        // addtrack/change, so a track that existed with ZERO cues at start and
+        // was filled in later — exactly what an HLS player does — was never
+        // reconsidered, because loading cues fires neither event.
+        //
+        // Both are guarded: an exception here used to kill the whole rescan
+        // chain, because nothing rescheduled it, so one throw meant no track
+        // or DOM discovery ever happened again for the rest of the session.
+        try { this._bindTracks(); } catch {}
+        try { this._scanDom(); } catch {}
         const settled = this.text || this._trackState.size || this._src.hook || this._src.timedtext;
         this._rescan = setTimeout(tick, settled ? 6000 : 1500);
       };
@@ -328,6 +339,9 @@
       this._hookL = (e) => {
         const d = e.data;
         if (!d || d.__flox !== 'FLOX_HOOK' || this._destroyed) return;
+        // Proves page-hook.js is running in this frame at all — if it is not,
+        // no network-captured subtitle file can ever arrive.
+        this._hookReady = true;
         if (d.event === 'cues') this._set('hook', d.text || '');
         else if (d.event === 'timedtext-list') this._loadTimedText(d.cues);
       };
@@ -353,10 +367,16 @@
       // `timedtext` is the highest-priority source, letting a background fetch
       // replace a working list swaps correct subtitles for wrong ones. Keep a
       // list that is currently producing text.
-      if (this._tt && this._src.timedtext) return;
-      // A different file means a different retiming — never carry an offset
-      // measured against the previous one.
-      if (this._tt !== cues) { this._ttOffset = null; this._offSamples = []; this._shiftDone = false; }
+      // An HLS track arrives as segments, so the list GROWS as playback goes on.
+      // That is the same track gaining detail, not a competing file, and it must
+      // be accepted — refusing it left only the segment that happened to be
+      // producing when the first one landed.
+      const prev = this._tt;
+      const growing = !!prev && cues.length > prev.length;
+      if (prev && this._src.timedtext && !growing) return;
+      // A genuinely different file means a different retiming — never carry an
+      // offset measured against the previous one. Growth is not a new file.
+      if (!growing) { this._ttOffset = null; this._offSamples = []; this._shiftDone = false; }
       this._tt = cues;
       if (this._ttTimer) return;
       const tick = () => {
@@ -661,13 +681,17 @@
       const tt = this.video.textTracks;
       if (!tt) return;
 
-      // Reconcile what we already hold. We park our tracks at 'hidden', so any
-      // other mode means the player changed it — the viewer turned subtitles
-      // off, or switched language. Release it and clear the line, otherwise the
-      // last cue sticks on screen forever AND (since `cue` outranks `hook` and
-      // `dom`) blocks every lower-priority source from ever showing again.
+      // Release a held track ONLY when it goes `disabled` — the viewer turning
+      // subtitles off, or switching language. Otherwise keep it.
+      //
+      // This used to release on any mode that was not `hidden`, which fought
+      // the player: we park the track at `hidden`, an HLS stack re-asserts its
+      // own mode as `showing`, and the next reconcile then released the track
+      // and cleared the line — over and over, so `cue` was permanently empty.
+      // `activeCues` is populated in BOTH `hidden` and `showing`, so there was
+      // never anything to gain from releasing.
       for (const [track, st] of [...this._trackState]) {
-        if (track.mode === 'hidden') continue;
+        if (track.mode !== 'disabled') continue;
         try { track.removeEventListener('cuechange', st.h); } catch {}
         this._trackState.delete(track);
         this._set('cue', '');
@@ -683,7 +707,11 @@
         // Never consume our own bridge track — the engine feeds it, and taking
         // it over would set it hidden and silence the very output we injected.
         if (track.__flox || track.label === 'Flox') return false;
-        if (!/subtitles|captions/i.test(track.kind || '')) return false;
+        // Reject by what a track definitely ISN'T, rather than requiring it to
+        // be labelled `subtitles`/`captions`. Players built on HLS/DASH stacks
+        // routinely leave `kind` empty or non-standard, and demanding the label
+        // threw away tracks that were carrying real dialogue.
+        if (/metadata|chapters|descriptions/i.test(track.kind || '')) return false;
         if (track.mode === 'disabled') return false;      // not the selected track
         // A player that draws its own captions parks the selected track at
         // `hidden` and reads it itself — cinejoy keeps 311 tracks there. Only
@@ -707,9 +735,10 @@
         this._detectTrackShift(track);
       };
       this._trackState.set(track, { mode: track.mode, h });
-      // Only take over rendering if the player was drawing it. A track the
-      // site already parked at `hidden` is left exactly as found.
-      if (track.mode === 'showing') track.mode = 'hidden';
+      // The track's mode is left exactly as the player set it. We used to force
+      // `showing` down to `hidden` to take over rendering, but an HLS stack
+      // re-asserts its own mode and the two sides then fought indefinitely.
+      // Reading is all we need, and `activeCues` works in either mode.
       track.addEventListener('cuechange', h);
       h();
     }
@@ -773,6 +802,11 @@
         if (el.tagName === 'VIDEO' || el.tagName === 'BUTTON' || el.closest('button')) continue;
         const r = el.getBoundingClientRect();
         if (r.width > innerWidth * 1.5) continue;          // page-wide junk
+        // A caption root has to occupy a real box. Name matching alone pulled in
+        // collapsed tooltips and settings submenus — on JW Player, five of the
+        // six adopted roots were 0x0 chrome, crowding out the one real caption
+        // container.
+        if (r.width < 40 || r.height < 8) continue;
         // Observing a big subtree and reading innerText out of it on every
         // mutation is what wedges a tab. Caption containers are tiny; anything
         // large is not one.
@@ -783,7 +817,18 @@
         // elements — easily picked before the real caption container exists —
         // locked the engine out for the rest of the session.
         if (this._domRoots.size >= MAX_SUB_ROOTS) {
-          const dead = [...this._domRoots].find(x => !this._produced.has(x));
+          // Evict the NEWEST non-producer, not the oldest. Roots are adopted in
+          // confidence order — site profile, then named selectors, then the
+          // geometric heuristics — so the oldest is the best guess we have.
+          // Dropping it first meant the real caption container was thrown out
+          // in favour of heuristic junk, over and over: it holds text only
+          // while a caption is on screen, so between cues it looks exactly as
+          // unproductive as a false positive and was always first in line.
+          const live = [...this._domRoots];
+          let dead = null;
+          for (let i = live.length - 1; i >= 0; i--) {
+            if (!this._produced.has(live[i])) { dead = live[i]; break; }
+          }
           if (!dead) break;
           this._drop(dead);
         }
@@ -1068,6 +1113,11 @@
       for (let i = 0; i < 8 && el; i++) {
         el = el.parentElement;
         if (!el) break;
+        // Never climb to <body> or <html>. In an embed iframe the video fills
+        // the frame, so every ancestor satisfies the size test and this walked
+        // all the way to the document element — which made the heuristic scans
+        // sweep the whole page and flood the root cap with unrelated matches.
+        if (el === document.body || el === document.documentElement) break;
         const r = el.getBoundingClientRect(), vr = this.video.getBoundingClientRect();
         if (r.width >= vr.width * 0.9 && r.height >= vr.height * 0.9 && r.width < innerWidth * 1.2) best = el;
       }
@@ -1577,6 +1627,23 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
           } catch {}
         }
       }
+      // The real <video> lives in THIS window, so the browser renders any
+      // `showing` track's cues here natively. The engine no longer forces such
+      // a track to `hidden` — doing so fought players that re-assert their own
+      // mode — so suppress our overlay instead of drawing the same line twice.
+      if (!this._hostSubs) {
+        try {
+          for (const t of this.video.textTracks || []) {
+            if (t.__flox || t.label === 'Flox') continue;
+            if (t.mode !== 'showing') continue;
+            if (/metadata|chapters|descriptions/i.test(t.kind || '')) continue;
+            this._hostSubs = true;
+            this.subsEl.classList.add('off');
+            break;
+          }
+        } catch {}
+      }
+
       this.subs = new SubtitleEngine(this.video);
       this.subs.onText = (text) => this._renderSubs(text);
       this.subs.onCanvas = (canvas) => this._bindCanvas(canvas);
@@ -1779,6 +1846,93 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
             y -= size * 1.3;
           }
         }
+        // Diagnostic readout, off unless toggled with Alt+D. Reports which
+        // subtitle source is winning and, when none is, which link in the chain
+        // is broken — subtitle data arriving at all, tracks existing, the
+        // page-world hook being alive in this frame.
+        if (S.debugSubs && this.subs) {
+          const s = this.subs;
+          const w = (x) => (x ? String(x).replace(/\n/g, ' / ').slice(0, 32) : '—');
+          // Count only tracks that could actually carry dialogue. Counting a
+          // metadata track (hls.js always creates one for timed ID3) made
+          // `live`/`withCues` look non-zero while the binder correctly refused
+          // it, which read as a contradiction and sent me chasing the binder.
+          let tt = { n: 0, sub: 0, live: 0, cued: 0 };
+          try {
+            const list = v.textTracks || [];
+            tt.n = list.length;
+            for (const t of list) {
+              if (/metadata|chapters|descriptions/i.test(t.kind || '')) continue;
+              tt.sub++;
+              if (t.mode !== 'disabled') tt.live++;
+              if (t.cues && t.cues.length) tt.cued++;
+            }
+          } catch {}
+          const rows = [
+            'src=' + (s._ttOffset != null ? 'FILE+off' : s._domProven ? 'DOM' : 'fallback') +
+              ' off=' + (s._ttOffset != null ? s._ttOffset.toFixed(2) + 's' : '—') +
+              ' n=' + s._offSamples.length + ' cues=' + (s._tt ? s._tt.length : 0),
+            'tracks=' + tt.n + ' sub=' + tt.sub + ' live=' + tt.live + ' withCues=' + tt.cued +
+              ' hook=' + (s._hookReady ? 'yes' : 'NO') +
+              ' roots=' + s._domRoots.size,
+            // Raw attributes of every track, exactly as the binder reads them.
+            // `bound=NO` alongside live/withCues>0 is contradictory, so these
+            // are the values that settle which field is disagreeing.
+            (() => {
+              let out = 'T:';
+              try {
+                for (const t of (v.textTracks || [])) {
+                  let n = 'null';
+                  try { n = t.cues ? String(t.cues.length) : 'null'; } catch (e) { n = 'ERR'; }
+                  out += ' [k=' + (t.kind || '∅') + ' m=' + t.mode + ' c=' + n +
+                         ' l=' + String(t.label || '∅').slice(0, 6) + ']';
+                }
+              } catch (e) { out += ' ITER-ERR ' + e.message; }
+              return out.slice(0, 62);
+            })(),
+            // Distinguishes "never bound" from "bound but activeCues is empty".
+            (() => {
+              const held = [...s._trackState.keys()][0];
+              if (!held) return 'bound=NO  (nothing adopted)';
+              let a = -1, n = -1;
+              try { a = (held.activeCues || []).length; } catch {}
+              try { n = (held.cues || []).length; } catch {}
+              return 'bound=yes mode=' + held.mode + ' cues=' + n + ' active=' + a +
+                     ' kind=' + (held.kind || '(none)');
+            })(),
+            'dom : ' + w(s._src.dom),
+            'cue : ' + w(s._src.cue),
+            'hook: ' + w(s._src.hook),
+            'file: ' + w(s._src.timedtext)
+          ];
+          // Mirror the same state onto the document element so an automated
+          // harness can read it — the engine lives in the isolated world, which
+          // page scripts and Playwright's evaluate() cannot reach.
+          try {
+            document.documentElement.dataset.floxStats = JSON.stringify({
+              src: s._ttOffset != null ? 'file' : s._domProven ? 'dom' : 'fallback',
+              off: s._ttOffset, cues: s._tt ? s._tt.length : 0,
+              roots: s._domRoots.size, produced: s._produced.size,
+              rootCls: [...s._domRoots].map((e) => String(e.className || e.tagName).slice(0, 30)),
+              dom: s._src.dom, cue: s._src.cue, hook: s._src.hook, file: s._src.timedtext,
+              text: s.text
+            });
+          } catch {}
+
+          const fs = Math.max(11, Math.round(c.height * 0.022));
+          ctx.font = '600 ' + fs + 'px monospace';
+          ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+          let dy = fs * 0.4;
+          for (const row of rows) {
+            const m = ctx.measureText(row);
+            ctx.fillStyle = 'rgba(0,0,0,.72)';
+            ctx.fillRect(fs * 0.3, dy, m.width + fs * 0.5, fs * 1.2);
+            ctx.fillStyle = '#7dff9b';
+            ctx.fillText(row, fs * 0.55, dy + fs * 0.1);
+            dy += fs * 1.3;
+          }
+        }
+
         // Always rAF: a frame-callback loop stalls the moment the source pauses,
         // which kills the canvas stream and desyncs the window's controls.
         this._raf = requestAnimationFrame(drawFrame);
@@ -2159,6 +2313,19 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
     // (AltGr composition, non-US layouts), and e.code stays stable across all
     // of them. e.key is only the fallback for layouts that remap the position.
     if (isTyping(e.target) || isTyping(document.activeElement)) return;
+
+    // Alt+D toggles the subtitle diagnostics overlay. Written to storage so it
+    // reaches whichever frame actually owns the video — on embed sites that is
+    // a nested iframe, not the one with keyboard focus.
+    if (e.code === 'KeyD') {
+      e.preventDefault();
+      const next = !S.debugSubs;
+      S.debugSubs = next;
+      if (current && current._applySettings) current._applySettings({ debugSubs: next });
+      try { chrome.storage.sync.set({ debugSubs: next }); } catch {}
+      hud('Flox: subtitle diagnostics ' + (next ? 'ON' : 'off'));
+      return;
+    }
 
     if (e.code !== 'Comma' && e.key !== ',' && e.key !== '<') return;
     e.preventDefault();
