@@ -30,11 +30,6 @@ chrome.runtime.onInstalled.addListener(async () => {
   // 1.5.0: bezel-less (browser frame, subtitles composited in) is the default.
   await apply('clean-window-1.5.0', { cleanWindow: true });
 
-  // 1.8.1: the subtitle-source readout shipped defaulting ON while the offset
-  // work was being diagnosed. Flipping the default alone leaves it on screen
-  // for anyone who already has `true` stored, so retire it explicitly.
-  await apply('debug-subs-off-1.8.1', { debugSubs: false });
-
   await chrome.storage.sync.set({ [MIGRATIONS_KEY]: [...done] });
 });
 

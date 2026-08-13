@@ -11,8 +11,7 @@
     subtitleBottom: 6, subtitleShadow: true, opacity: 1, transparencyEnabled: false,
     showControls: true, hoverControls: true, pauseOnClose: false, returnOnClose: true,
     rememberSize: true, lastSize: { width: 640, height: 360 }, mode: 'auto',
-    autoPipOnTabHide: false, keepAspect: true, drmNative: false, forceNative: false, cleanWindow: true,
-    debugSubs: false  // subtitle-source readout on the pop-out (diagnostic)
+    autoPipOnTabHide: false, keepAspect: true, drmNative: false, forceNative: false, cleanWindow: true
   };
 
   let S = { ...DEFAULTS };
@@ -240,6 +239,18 @@
   // song or a held sign translation, short enough to bound the scan.
   const MAX_CUE_SPAN = 30;
 
+  // How often to look for the displayed caption while calibrating. This bounds
+  // the timing error of every sample, so it is the accuracy floor.
+  // Calibration tuning. CAL_FAST_MS is the accuracy floor: a sample can be at
+  // most this late, and `currentTime` itself only advances once per frame
+  // (~16-40ms), so polling faster than this buys nothing real.
+  const CAL_FAST_MS = 60;             // while acquiring an offset
+  const CAL_SLOW_MS = 1000;           // verification once acquired
+  const CAL_TARGET = 12;              // samples before dropping to slow polling
+  const CAL_WALK_BACKOFF_MS = 400;    // min gap between full searches after a miss
+  const CAL_WALK_MAX_NODES = 4000;    // hard bound on one search
+  const CAL_MAX_OFFSET = 600;         // reject absurd retimings (seconds)
+
   class SubtitleEngine {
     constructor(video) {
       this.video = video;
@@ -263,6 +274,12 @@
       this._offSamples = [];                       // recent offset measurements, seconds
       this._shiftDone = false;                     // track-vs-file comparison already concluded
       this._seekAt = null;                         // last seek, for suppressing measurements
+      this._startedAt = null;                      // engine start, for the settle guard
+      this._mismatch = 0;                          // consecutive dom-vs-file disagreements
+      this._lastCalText = null;                    // last line the calibrator saw displayed
+      this._calEl = null;                          // cached caption element
+      this._lastWalkAt = null;                     // throttles the full search
+      this._calTimer = 0;
       this._lastMutated = null;                    // root whose TEXT changed most recently
       this._readQueued = false;
       this.onRoot = () => {};                      // notified as roots are adopted
@@ -277,6 +294,8 @@
     }
 
     start() {
+      this._startedAt = performance.now();
+      this._startCalibrator();
       this._startHook();
       this._bindTracks();
       // `change` fires when the user switches subtitle track in the site's own
@@ -348,17 +367,22 @@
       // what read as roughness. Seeks are handled by event rather than by
       // waiting for the next tick, so the line never lags a jump.
       this._ttTimer = setInterval(tick, 50);
-      this._onTtSeek = () => { this._seekAt = performance.now(); tick(); };
+      // Only a COMPLETED seek suppresses measurement, and only briefly. Arming
+      // this on `seeking` too was a mistake: players emit that during buffering
+      // and segment switches, so the suppression window was continuously
+      // re-armed and calibration could be starved indefinitely.
+      this._onTtSeek = () => tick();
+      this._onTtSeeked = () => { this._seekAt = performance.now(); tick(); };
       const v = this.video;
       try {
         v.addEventListener('seeking', this._onTtSeek);
-        v.addEventListener('seeked', this._onTtSeek);
+        v.addEventListener('seeked', this._onTtSeeked);
       } catch {}
       this._observers.push(() => {
         clearInterval(this._ttTimer);
         try {
           v.removeEventListener('seeking', this._onTtSeek);
-          v.removeEventListener('seeked', this._onTtSeek);
+          v.removeEventListener('seeked', this._onTtSeeked);
         } catch {}
       });
       tick();
@@ -420,55 +444,189 @@
       if (Math.abs(med) > 0.2) { this._ttOffset = med; this._offSamples = [med]; }
     }
 
-    _measureOffset(domText) {
+    /* `now` is passed in, captured at the instant the caption appeared. It is
+     * never read from the video here: this used to fall back to currentTime
+     * whenever the read arrived late, which silently encoded rendering lag into
+     * the measurement. Under stutter or tab throttling every sample was
+     * inflated by however long the pipeline was behind, and the offset locked
+     * seconds late for the rest of the session.
+     */
+    /* Index of everything the file can display: each cue's full text, and each
+     * of its lines separately, because a two-line caption is usually rendered
+     * as two sibling elements and a text node then holds only one line.
+     * Anything occurring more than once maps to null — it cannot identify a
+     * position, so it is never used. Built once per file: O(cues) time, O(cues)
+     * space, and lookups are O(1). */
+    _cueTextIndex() {
+      if (this._cueIdx && this._cueIdxFor === this._tt) return this._cueIdx;
+      const m = new Map();
+      const add = (k, c) => { if (k.length >= 6) m.set(k, m.has(k) ? null : c); };
+      for (const c of this._tt || []) {
+        add(this._norm(c.t), c);
+        if (/[\r\n]/.test(c.t)) {
+          for (const line of c.t.split(/\r?\n/)) add(this._norm(line), c);
+        }
+      }
+      this._cueIdx = m;
+      this._cueIdxFor = this._tt;
+      return m;
+    }
+
+    /* CALIBRATION
+     *
+     * Mutation observers are useless on a player that rebuilds its caption DOM
+     * instead of mutating it — the onset never fires. So poll for the displayed
+     * line and treat a CHANGE as the onset: sample error is then bounded by the
+     * poll interval, and the one-sided minimum grinds it down from there.
+     *
+     * Cost is the constraint. A naive sweep reads textContent on every
+     * candidate, and textContent concatenates that element's whole subtree, so
+     * a full pass is O(nodes x subtree) — on the same main thread that decodes
+     * video. Three things keep this cheap:
+     *
+     *   1. Once located, the element is cached. Steady state is one small
+     *      textContent read per tick: O(1).
+     *   2. A miss walks TEXT NODES, not elements, so each read is O(len) of one
+     *      node rather than O(subtree). One bounded pass, no quadratic blowup.
+     *   3. A failed walk backs off, so gaps between captions cannot spin it.
+     *
+     * Polling drops to a slow verification rate once enough samples exist.
+     */
+    _startCalibrator() {
+      if (this._calTimer) return;
+      const tick = () => {
+        if (this._destroyed) return;
+        try { this._calibrate(); } catch {}
+        const acquiring = this._offSamples.length < CAL_TARGET;
+        this._calTimer = setTimeout(tick, acquiring ? CAL_FAST_MS : CAL_SLOW_MS);
+      };
+      this._calTimer = setTimeout(tick, CAL_FAST_MS);
+      this._observers.push(() => clearTimeout(this._calTimer));
+    }
+
+    _calibrate() {
       const cues = this._tt;
-      if (!cues || !cues.length || !domText) return;
-      // Prefer the position stamped at the mutation; fall back to now, which is
-      // simply a later — and therefore larger — sample, which the minimum below
-      // discards on its own.
-      // A caption rendered before a seek, read after it, yields a sample that is
-      // wrong by the whole jump. One of those can drag the estimate off for the
-      // rest of the session, so measurement stops across a seek entirely.
-      if (this.video.seeking) return;
-      const fresh = this._mutAt != null && (performance.now() - this._mutAt) < 400;
-      if (this._seekAt != null && performance.now() - this._seekAt < 1200) return;
-      const now = fresh ? this._mutT : this.video.currentTime;
+      if (!cues || !cues.length) return;
+      const idx = this._cueTextIndex();
+      if (!idx.size) return;
+      let now;
+      try { now = this.video.currentTime; } catch { return; }
       if (!isFinite(now)) return;
+
+      let hit = this._readCalCache(idx);
+      if (!hit) {
+        // Backed off: during a gap between captions nothing can match, and
+        // walking on every tick just to rediscover that is pure waste.
+        const t0 = performance.now();
+        if (this._lastWalkAt != null && t0 - this._lastWalkAt < CAL_WALK_BACKOFF_MS) return;
+        this._lastWalkAt = t0;
+        hit = this._locateCaption(idx);
+      }
+      if (!hit) { this._lastCalText = null; return; }     // nothing on screen
+      if (hit.key === this._lastCalText) return;          // still the same line
+      this._lastCalText = hit.key;
+      this._measureOffset(hit.raw, now);
+    }
+
+    /** O(1): read the element already known to hold captions. */
+    _readCalCache(idx) {
+      const el = this._calEl;
+      if (!el || !el.isConnected) return null;
+      const raw = (el.textContent || '').trim();
+      if (raw.length < 6 || raw.length > 300) return null;
+      const key = this._norm(raw);
+      return idx.get(key) ? { key, raw } : null;
+    }
+
+    /** One bounded pass over text nodes. Caches the element it finds. */
+    _locateCaption(idx) {
+      const root = this._playerRoot() || document.body;
+      let tw;
+      try { tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT); } catch { return null; }
+      let n, seen = 0;
+      while ((n = tw.nextNode())) {
+        if (++seen > CAL_WALK_MAX_NODES) break;
+        const raw = (n.nodeValue || '').trim();
+        if (raw.length < 6 || raw.length > 300) continue;
+        const key = this._norm(raw);
+        if (!idx.get(key)) continue;                     // no match, or ambiguous
+        const el = n.parentElement;
+        if (!el || !vis(el, true)) continue;
+        this._calEl = el;
+        return { key, raw };
+      }
+      return null;
+    }
+
+    _measureOffset(domText, now) {
+      const cues = this._tt;
+      if (!cues || !cues.length || !domText || !isFinite(now)) return;
+      // A caption rendered before a seek, read after it, is wrong by the whole
+      // jump. Measurement stops across a seek entirely.
+      if (this.video.seeking) return;
+      if (this._seekAt != null && performance.now() - this._seekAt < 500) return;
+      // At the instant of pop-out the player is still settling: the caption
+      // layer can still hold the previous line and currentTime is not yet
+      // steady. Measuring then locked a badly wrong offset that only a seek
+      // would shake loose.
+      if (this.video.readyState < 3) return;
+      if (this._startedAt == null || performance.now() - this._startedAt < 1500) return;
       const key = this._norm(domText);
       if (key.length < 6) return;              // too short to identify a line
 
-      // Only consider cues within a plausible retiming distance, and prefer the
-      // candidate nearest the offset already believed, so a repeated line does
-      // not yank the estimate around.
-      const WINDOW = 180;
-      let best = null;
-      for (const c of cues) {
-        if (Math.abs(c.s - now) > WINDOW) continue;
-        if (this._norm(c.t) !== key) continue;
-        const off = now - c.s;
-        const ref = this._ttOffset == null ? 0 : this._ttOffset;
-        if (!best || Math.abs(off - ref) < Math.abs(best - ref)) best = off;
-      }
-      if (best == null) return;
+      // O(1) lookup. This used to scan every cue on every sample; the index
+      // already marks anything repeated as null, so ambiguity is rejected
+      // globally rather than within a window, which is both cheaper and
+      // stricter.
+      const match = this._cueTextIndex().get(key);
+      if (!match) return;
+      if (Math.abs(now - match.s) > CAL_MAX_OFFSET) return;   // absurd, reject
+      const best = now - match.s;
 
       const S = this._offSamples;
       S.push(best);
-      if (S.length > 16) S.shift();
-      if (S.length < 2) return;
+      if (S.length > 24) S.shift();
 
-      // Reject a coincidental text match before it can move the estimate.
+      // Retiming changed mid-playback. The estimate is a one-sided MINIMUM, so
+      // it can only ever move down — raising the delay would otherwise never be
+      // picked up, because every new sample is larger than the old answer and
+      // gets ignored. A sustained run of samples far from the current estimate
+      // is the signal to drop the history and re-acquire.
+      if (this._ttOffset != null && S.length >= 4 &&
+          S.slice(-4).every((x) => Math.abs(x - this._ttOffset) > 1)) {
+        this._offSamples = [best];
+        this._ttOffset = null;
+        return;
+      }
+
+      /* Smallest CORROBORATED sample wins.
+       *
+       * Measurement error is one-sided — a caption can be observed at or after
+       * the instant it appeared, never before — so every sample is the true
+       * offset plus some latency, and the infimum is the truth. Taking a plain
+       * minimum trusts a single freak match; taking the median-of-a-band, as
+       * before, could not revise DOWNWARD once a run of laggy samples had set
+       * the band, so a stuttery first minute locked the offset seconds late and
+       * later clean samples were rejected as outliers.
+       *
+       * Requiring a second sample within 0.3s to confirm gives both: outliers
+       * are ignored, and a better (smaller) pair always supersedes a worse one.
+       */
       const sorted = [...S].sort((a, b) => a - b);
-      const med = sorted[sorted.length >> 1];
-      const near = sorted.filter((x) => Math.abs(x - med) < 2);
-      if (near.length < 2) return;
-
-      // Measurement error here is one-sided: a caption can be observed at or
-      // AFTER the instant it appeared, never before, so every sample is the
-      // true offset plus some latency. The smallest sample is therefore the
-      // closest to the truth, and more samples only sharpen it. Averaging
-      // instead baked the latency in — which is why a -34s retiming measured
-      // as -32.86s.
-      this._ttOffset = near[0];
+      // Prefer a tight cluster, but do not REQUIRE one. Demanding two samples
+      // within 0.3s made locking so rare that the offset often never resolved
+      // at all — worse than the loose lock it replaced. Widen until something
+      // corroborates: a tight pair wins when it exists, and a loose pair still
+      // beats no answer. Later samples keep re-running this, so the estimate
+      // tightens and can always move down as cleaner data arrives.
+      for (const tol of [0.3, 0.75, 2]) {
+        for (let i = 0; i < sorted.length; i++) {
+          if (sorted.some((x, j) => j !== i && Math.abs(x - sorted[i]) < tol)) {
+            this._ttOffset = sorted[i];
+            return;
+          }
+        }
+      }
     }
 
     _ttAt(t) {
@@ -594,6 +752,16 @@
       if (!this._produced.size) {
         for (const el of this._overlayCandidates(container)) candidates.add(el);
         for (const el of this._positionalCandidates(container)) candidates.add(el);
+        // _playerRoot() is a guess, and a caption layer rendered into a portal
+        // or a sibling container sits outside it. Nothing has produced text, so
+        // widen to the whole document rather than trusting that guess.
+        if (container !== document.body) {
+          for (const el of this._overlayCandidates(document.body)) candidates.add(el);
+        }
+        // The calibrator locates the real caption element by matching its text
+        // against the subtitle file, which is far more reliable than any shape
+        // rule. Reuse that result so the `dom` source reads the right element.
+        if (this._calEl && this._calEl.isConnected) candidates.add(this._calEl);
       }
 
       // Prune roots the site has thrown away, or we accumulate observers forever.
@@ -627,12 +795,9 @@
         const mo = new MutationObserver((recs) => {
           if (recs.some(r => r.type === 'childList' || r.type === 'characterData')) {
             this._lastMutated = el;
-            // Stamp the playback position AT the mutation. Reading it later in
-            // _readDom() measured the offset late by however long the rest of
-            // the pipeline took, and that error is one-sided so it biased every
-            // measurement the same way.
-            try { this._mutT = this.video.currentTime; } catch {}
-            this._mutAt = performance.now();
+            // No measurement here. Calibration is polled (see _calibrate),
+            // because players that rebuild their caption DOM never emit a
+            // usable onset mutation at all.
           }
           this._queueRead();
         });
@@ -745,8 +910,7 @@
       const t = this._extract(el);
       let st = this._seen.get(el);
       if (!st) { this._seen.set(el, { last: t, changed: false }); return ''; }
-      const onset = t !== st.last;
-      if (onset) { st.last = t; st.changed = true; }
+      if (t !== st.last) { st.last = t; st.changed = true; }
       if (!st.changed) return '';
       // Vetting applies only until a root has proven itself. A clock or a
       // letterless string is evidence that a candidate is chrome, not dialogue
@@ -754,10 +918,8 @@
       // otherwise real subtitles that happen to be music notation, a dash or a
       // bare number get silently dropped.
       if (t && !this._produced.has(el) && !isDialogue(t)) return '';
-      // Only an ONSET carries timing information. Re-measuring the same line on
-      // later reads just fed progressively later — and so progressively more
-      // wrong — samples into the estimate.
-      if (t) { this._proveDom(); if (onset) this._measureOffset(t); }
+      // Calibration does not happen here — see _calibrate(), which is polled.
+      if (t) this._proveDom();
       return t;
     }
 
@@ -852,6 +1014,33 @@
       text = (text || '').replace(/\n{2,}/g, '\n').trim();
       if (this._src[kind] === text) return;
       this._src[kind] = text;
+
+      /* Continuous self-check. What the player renders is ground truth, so if
+       * the shifted file disagrees with it repeatedly, the offset is simply
+       * wrong — throw it away and measure again. Without this a bad lock was
+       * permanent, and the only way out was to seek until it re-measured.
+       * A few disagreements are normal: the two sources update on different
+       * clocks, so only a sustained run counts.
+       */
+      const d = this._src.dom, f = this._src.timedtext;
+      if (this._ttOffset != null && d && f) {
+        if (this._norm(d) === this._norm(f)) this._mismatch = 0;
+        else if (++this._mismatch >= 4) {
+          this._mismatch = 0;
+          // Differing text is NORMAL near a cue boundary when the estimate is
+          // off by a fraction of a second, so the fact of a disagreement means
+          // little. Measure the size of it instead: look up what the player is
+          // showing and compare where that line actually sits. Only a gross
+          // error means the lock is bad and worth discarding.
+          const cue = this._cueTextIndex().get(this._norm(d));
+          let now = NaN;
+          try { now = this.video.currentTime; } catch {}
+          if (cue && isFinite(now) && Math.abs((now - cue.s) - this._ttOffset) > 5) {
+            this._ttOffset = null;
+            this._offSamples = [];
+          }
+        }
+      }
       // Once the DOM source is proven working it becomes exclusive, and STAYS
       // exclusive. This flag is deliberately sticky: it was previously derived
       // from the live set of producing roots, so when the player replaced its
@@ -1526,11 +1715,26 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
   class CanvasFallbackSession {
     constructor(video) { this.video = video; this.closed = false; }
 
+    /* The canvas is re-encoded and re-decoded every frame, so its size is pure
+     * cost. Rendering a 4K source at full resolution to feed a window a few
+     * hundred pixels wide burns fill rate and encode time for detail the window
+     * can never show — and that cost lands on the same main thread the page
+     * uses to decode video and update captions, so it shows up as stutter.
+     * Cap the long edge; the source is scaled on the way in.
+     */
+    _canvasSize(w, h) {
+      const MAX = 1280;
+      if (!w || !h) return { w: 1280, h: 720 };
+      const scale = Math.min(1, MAX / Math.max(w, h));
+      return { w: Math.max(2, Math.round(w * scale)), h: Math.max(2, Math.round(h * scale)) };
+    }
+
     async open(settings) {
       S = settings || S;
       const v = this.video;
       const c = this.canvas = document.createElement('canvas');
-      c.width = v.videoWidth || 1280; c.height = v.videoHeight || 720;
+      const fit = this._canvasSize(v.videoWidth || 1280, v.videoHeight || 720);
+      c.width = fit.w; c.height = fit.h;
       c.style.cssText = 'position:fixed;left:-10000px;top:0;pointer-events:none;';
       document.body.appendChild(c);
       const ctx = c.getContext('2d', { alpha: false, desynchronized: true });
@@ -1551,8 +1755,9 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
 
       const drawFrame = () => {
         if (this.closed) return;
-        if (v.videoWidth && (c.width !== v.videoWidth || c.height !== v.videoHeight)) {
-          c.width = v.videoWidth; c.height = v.videoHeight;
+        if (v.videoWidth) {
+          const f = this._canvasSize(v.videoWidth, v.videoHeight);
+          if (c.width !== f.w || c.height !== f.h) { c.width = f.w; c.height = f.h; }
         }
         try { ctx.drawImage(v, 0, 0, c.width, c.height); } catch {}
         // The draw loop starts before the subtitle engine does — PiP must be
@@ -1574,36 +1779,6 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
             y -= size * 1.3;
           }
         }
-        // TEMPORARY DIAGNOSTIC. Prints which subtitle source is actually
-        // winning, straight onto the pop-out. Remove once sync is confirmed.
-        if (S.debugSubs && this.subs) {
-          const s = this.subs;
-          const w = (x) => (x ? String(x).replace(/\n/g, ' ⏎ ').slice(0, 34) : '—');
-          const rows = [
-            'src=' + (s._ttOffset != null ? 'FILE+off' : s._domProven ? 'DOM' : 'fallback') +
-              ' off=' + (s._ttOffset != null ? s._ttOffset.toFixed(2) + 's' : '—') +
-              ' n=' + s._offSamples.length +
-              ' cues=' + (s._tt ? s._tt.length : 0) +
-              ' roots=' + s._domRoots.size + ' ok=' + s._produced.size,
-            'dom : ' + w(s._src.dom),
-            'cue : ' + w(s._src.cue),
-            'hook: ' + w(s._src.hook),
-            'file: ' + w(s._src.timedtext)
-          ];
-          const fs = Math.max(11, Math.round(c.height * 0.022));
-          ctx.font = `600 ${fs}px monospace`;
-          ctx.textAlign = 'left'; ctx.textBaseline = 'top';
-          let dy = fs * 0.4;
-          for (const row of rows) {
-            const m = ctx.measureText(row);
-            ctx.fillStyle = 'rgba(0,0,0,.72)';
-            ctx.fillRect(fs * 0.3, dy, m.width + fs * 0.5, fs * 1.2);
-            ctx.fillStyle = '#7dff9b';
-            ctx.fillText(row, fs * 0.55, dy + fs * 0.1);
-            dy += fs * 1.3;
-          }
-        }
-
         // Always rAF: a frame-callback loop stalls the moment the source pauses,
         // which kills the canvas stream and desyncs the window's controls.
         this._raf = requestAnimationFrame(drawFrame);
@@ -1983,8 +2158,9 @@ input[type=range].mini::-webkit-slider-thumb{-webkit-appearance:none;width:9px;h
     // Match on physical key first: Alt on some layouts rewrites e.key entirely
     // (AltGr composition, non-US layouts), and e.code stays stable across all
     // of them. e.key is only the fallback for layouts that remap the position.
-    if (e.code !== 'Comma' && e.key !== ',' && e.key !== '<') return;
     if (isTyping(e.target) || isTyping(document.activeElement)) return;
+
+    if (e.code !== 'Comma' && e.key !== ',' && e.key !== '<') return;
     e.preventDefault();
     e.stopImmediatePropagation();
 
